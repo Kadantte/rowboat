@@ -10,18 +10,28 @@ pipeline, and the LLM prompt surface with exact pointers.
 ## Product flow
 
 The composer has a **call split-button** (`chat-input-with-mentions.tsx`).
-The main click is the "work together" default — preset `share`: screen
-sharing ON, camera OFF, floating pill, so the user keeps working while the
-assistant watches along (the button tooltip discloses the screen share). The
-chevron menu holds the deviations. While a call is live the button turns red
-and ends it.
+The main click is the **hover companion** — preset `voice`: the SAME
+Skipper surface ⌥⇧Space summons (`startHoverCall()` in `App.tsx`), bound to
+this chat. The chevron menu holds the deviations. While a call is live the
+button turns red and ends it.
 
 | Preset | Starting devices | First surface |
 |--------|------------------|---------------|
-| `share` — main click | screen on, camera off | floating pill |
-| `voice` — no menu entry (programmatic only; the quick-ask bar's voice toggle covers this case) | camera off, screen off | floating mascot pill |
+| `voice` — main click, ⌥⇧Space, tray "Quick Ask", the card's tuck handle, the Home Skipper, the discoverability toast | camera off, screen off (sticky share replays if opted in) | the Skipper card (hover mode) |
+| `share` — "Share screen" | screen on, camera off | the Skipper card — the same hover summon with the screen shared from the start |
 | `video` — "Video call" | camera on | floating pill (camera in the pill; expand for full screen) |
 | `practice` — "Practice session" | camera on, + coaching persona | full-screen call |
+
+**ONE hover flow.** Every hover entry point ends in `startHoverCall()`:
+the chord / tray item / tuck handle / toast go main → `relaySummon()` →
+`quick-ask:tuck` → app; the call button and the Home Skipper call it
+directly. It acks the relay (`quickAsk:tuckAck`), starts the `voice`
+preset, and only THEN kicks off the (sticky or `share`-forced) screen
+share, fire-and-forget — the in-flight guard is released the moment the
+call engine settles, never held across device acquisition. A session that
+fails to start falls back to the text card (`quickAsk:show`), so a summon
+is never a silent no-op. Without voice configured the text card is the
+answer from the start.
 
 **One surface rule** (`callSurface` in `App.tsx`): full screen and screen
 sharing are mutually exclusive in both directions — a full-screen call covers
@@ -53,12 +63,10 @@ hands-free" when idle, "Listening — release to send" while capturing,
 "Hands-free — tap ⌘ to send" while locked. The popout additionally embeds
 the REAL chat composer (`ChatInputWithMentions`) as its typed input —
 @-mentions, attachments, and per-turn config all work mid-call, and
-messages land in the chat like composer messages, frames riding along —
-and a collapsible **response panel**: the latest assistant reply of the
-call streams into the pill (auto-opens on each new turn,
-`video:popoutResize` grows the window), so a typed question can be
-read right there without switching back to the app. Replies are spoken
-too; the panel is the readable half. **Mute is a full input
+messages land in the chat like composer messages, frames riding along.
+NO transcript renders in the pill (in either direction) — minimized
+surfaces show none; replies are spoken aloud, and expanding is how you
+read. **Mute is a full input
 pause**, not just audio — mic audio stops reaching Deepgram
 (`useVoiceMode.setPaused`, OR'd with the automatic thinking/speaking pause)
 AND camera/screen frame capture stops (`useVideoMode.setCapturePaused`;
@@ -86,10 +94,10 @@ The call button is disabled unless both voice input (Deepgram) and voice
 output (TTS) are configured. `call_started` (with `preset`) is captured in
 PostHog — the adoption metric for this feature.
 
-**Popout mechanics**: the floating pill is the COMPANION WINDOW's pinned
-role — the same always-on-top window as the ⌥⇧Space quick-ask bar, swapped
-to the pill layout (camera tile when on + mascot tile, live caption,
-control bar, composer) and repositioned top-right. It floats over every
+**Popout mechanics**: the floating pill is the COMPANION WINDOW (the same
+always-on-top window ⌥⇧Space summons) in its pill layout — camera tile when
+on + mascot tile, live caption, control bar, composer — repositioned
+top-right. It floats over every
 app — including Rowboat. Control-bar actions round-trip
 `video:popoutAction` → main → `video:popout-action` → app window, which
 owns the mic/camera/capture; `expand` also refocuses the app window
@@ -191,12 +199,21 @@ and starts the PTT session; ending restores everything. Composer dictation
 is disabled while a call owns the mic. Mute blocks PTT entirely (pressing
 the key while muted does nothing; muting mid-capture discards it).
 
-## The pill = the companion window's pinned role
+## The companion window (the hover surface)
 
-There is no separate popout window anymore: the quick-ask window
-(`apps/main/src/quick-ask.ts`, renderer `components/quick-ask-bar.tsx`,
-hash `#quick-ask`) plays both floating roles, switched by a mode pushed
-over `quick-ask:mode` (`'summoned' | 'pinned'`).
+One always-on-top window (`apps/main/src/quick-ask.ts`, renderer
+`components/quick-ask-bar.tsx`, hash `#quick-ask`) with ONE visible role,
+pushed over `quick-ask:mode` (`'pinned' | 'hidden'`): the Skipper — a
+self-contained card (top strip: logo · destination · window actions · share
+· talk/stop · small ✕ dismiss, over the real composer), or the pill when a
+live camera needs its self-view. The mascot lives on only in the camera
+pill; the card carries its signals instead — the composer flips to the app
+composer's recording bar (waveform + interim transcript) while the mic gate
+is open, wired to the call's PTT machine (↑ sends `ptt-up`, ✕ discards
+`ptt-cancel`); a running turn shows as the strip logo's glow plus a
+spinner-and-shimmer activity row in the response panel; the composer
+placeholder names the platform talk key ("hold right ⌘ / right Ctrl to
+speak"). There is no separate popout window, and no second "ask bar" role.
 
 - The window is an NSPanel (`type: 'panel'`) with
   `setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true,
@@ -209,17 +226,45 @@ over `quick-ask:mode` (`'summoned' | 'pinned'`).
   the whole screen).
 - Pinned iff the derived `callSurface === 'popout'` (effect in `App.tsx`).
   Renderer asks `video:setPopout {show}`; main repositions the companion
-  window to the old popout geometry (top-right of the primary display,
-  content-sized; `video:popoutResize` grows it for the response panel) and
-  shows it with `showInactive()` so it never steals focus. Blur does NOT
-  hide it in this mode (Spotlight blur-dismiss applies to the summoned role
-  only), Esc never dismisses it, and ⌥⇧Space focuses it instead of
-  toggling.
+  window (Skipper card at its anchor corner, or the old popout geometry
+  top-right for camera calls; the `video:popoutResize` channel remains for
+  renderer-driven pill heights but nothing drives it since the response
+  panel was removed) and reveals it — focused when a summon is pending,
+  `showInactive()` otherwise so it never steals focus. Blur does NOTHING
+  (a companion you work next to must not vanish when you click away), Esc
+  tucks the text rather than dismissing, and ⌥⇧Space folds/unfolds the
+  text panel.
+- **Reveal protocol**: every `quick-ask:mode` push carries a `seq`; the
+  renderer acks it over `quickAsk:modeApplied` two frames after committing
+  that presentation (i.e. once it is painted). Main orders the window in at
+  opacity 0 so the renderer can paint, then sets opacity 1 (+ focus) only
+  on the ack — never with a half-built layout on screen. A fold also pushes
+  first and shrinks the window on the ack, so the open card is never
+  squeezed into mascot-sized bounds for a frame. Timeouts (600 ms; 6 s
+  while the page is still loading) keep a wedged renderer from blocking.
+  The renderer paints NOTHING until it knows its role (and nothing at all
+  while hidden), and `index.html` gives `#quick-ask` / `#screen-pointer` a
+  transparent background from the very first paint.
 - Call state streams over the `video:popout-state` push channel; main
-  caches the last payload (in quick-ask.ts) and replays it on window load.
+  caches the last payload (in quick-ask.ts) and replays it on window load
+  and on every pin. The renderer drops its mirror whenever it leaves the
+  pinned role; the app pushes an explicit idle state when a call ENDS (the
+  cache survives fullscreen ⇄ popout flaps of a live call, so a camera
+  call comes back as the pill, not a card that morphs).
+- No app window (the user closed it) or one still loading: the summon
+  recreates it hidden (`initQuickAsk({ ensureAppWindow })` in `main.ts`)
+  and re-fires the relay on the app's `quickAsk:appReady` handshake; an
+  unanswered relay is re-sent once by a watchdog (1.5 s with an app window
+  up, 8 s while it boots) and then logged, never answered with some other
+  surface. Closing the app window mid-call unpins the companion
+  (`onAppWindowClosed`).
 - The pill captures its **own** camera preview (MediaStreams can't cross
   windows) and synthesizes the mascot mouth level (no audio in that
-  window).
+  window). The card's recording-bar waveform is REAL, though: the app
+  window relays the voice hook's per-frame amplitudes (~16/s, batched)
+  over `video:popoutLevels` → `video:popout-levels`, so the bars track
+  actual speech at the app composer's own cadence. Levels are never
+  cached in main — a waveform is only meaningful live.
 - **Tiles show live pixels; controls show capabilities.** A voice-only
   call (camera off, no share) renders the pill WITHOUT the "You" tile —
   mascot + response + composer + controls — so untucking a voice call
@@ -231,20 +276,22 @@ over `quick-ask:mode` (`'summoned' | 'pinned'`).
   not be shown or messaged. Right ⌘ pressed while the pill has focus also
   relays as ptt-down/ptt-up actions (no Input Monitoring needed for that
   case).
-- **Tucked (mascot-only voice-to-voice)**: the pinned pill can collapse to
-  just the mascot (`quickAsk:setPinnedCollapsed`; presentation state is
-  pushed with `quick-ask:mode`). The mascot is the drag handle; hover
-  reveals hold-to-talk / bring-text-back / end-call; a one-line caption
-  shows interim speech and the spoken reply's tail; an active screen share
-  KEEPS its consent badge. The summoned bar's tuck handle (») enters this
-  state via `quickAsk:tuck` → `quick-ask:tuck` → the app starts the
-  `voice`-preset call (which opens minimized → floating surface) or, if a
-  call is already live, minimizes it. Tucking from the bar places the
-  mascot bottom-right of the cursor's display (it stays with the user);
-  collapsing an existing pill shrinks it in place toward its nearest
-  corner. ⌥⇧Space while tucked brings the text back; tuck/untuck never
-  ends the call — only the end-call control does. This is the `voice`
-  preset's "floating mascot pill" surface, finally shipped.
+- **Tucked (the mini call pill, voice-to-voice)**: the pinned surface can
+  collapse to the mini call pill (`quickAsk:setPinnedCollapsed`;
+  presentation state is pushed with `quick-ask:mode`): logo (click to
+  unfold) · status lane · share · talk/stop · end, with the pill body as
+  the drag handle and a « unfold handle on the pill's left edge — the
+  visible way back to the text input, mirroring the card's » tuck handle
+  (⌥⇧Space and the logo work too). The lane keeps narrating while folded — jittery
+  waveform while the user speaks, spinner + shimmer activity while a turn
+  thinks, a coherent rolling speak wave while the reply is read aloud, the
+  talk-key hint ("Hold right ⌘" / "Hold right Ctrl", platform-aware via
+  shared/ptt-key.ts) at rest — and beyond that hint the motion is the
+  whole story: the pill shows NO transcript in either direction (the user
+  tucked the text away; unfold to read). A live share keeps its consent badge on the lit share button.
+  The card's tuck handle (»), Esc, and a click on the stage near the card
+  all enter this state; ⌥⇧Space toggles it. Tuck/untuck never ends the
+  session — only End & close does.
 
 ## Permissions
 
@@ -254,7 +301,11 @@ over `quick-ask:mode` (`'summoned' | 'pinned'`).
 - Screen: `getDisplayMedia` is auto-approved with the primary screen by
   `setDisplayMediaRequestHandler` in `main.ts` (no picker);
   `meeting:checkScreenPermission` registers the app in macOS Screen
-  Recording settings on first use.
+  Recording settings on first use. With the permission denied (or its
+  prompt unanswered) `getDisplayMedia` can hang forever, so
+  `useVideoMode.startScreenShare` time-boxes the whole acquisition
+  (10 s) and fails cleanly — a hung share used to wedge `screenState` at
+  'starting' for the rest of the session.
 - Input Monitoring (global PTT key hook): starting the uiohook event tap
   triggers the macOS consent prompt on first use, but a missing grant
   doesn't error — events just never arrive (`eventsSeen` stays false). A
@@ -295,8 +346,8 @@ a finger on the chart.
   no renderer round-trip, and it hard-fails with an explanation when no
   share is live.
 - Share gate: an App.tsx effect reports `video.screenState === 'live'` over
-  `screenPointer:setShareActive` (covers call AND quick-ask shares); share
-  end tears the pointer down instantly.
+  `screenPointer:setShareActive`; share end tears the pointer down
+  instantly.
 - Overlay: `apps/main/src/screen-pointer.ts` creates a transparent,
   click-through (`setIgnoreMouseEvents`), non-focusable, screen-saver-level
   NSPanel covering the primary display (the share always captures the
@@ -372,39 +423,36 @@ distribution (utterance → submit → first speak → audio playing):
 - **Acknowledgment cue** (`lib/call-sounds.ts`): a soft blip the instant an
   utterance is accepted — perceived latency matters as much as measured.
 
-## Quick-ask bar (the companion window's summoned role)
+## Typing on the Skipper
 
-Global ⌥⇧Space summons a Spotlight-style bar over any app — the SAME
-window as the call pill above, in its `summoned` mode. The input is the
-real chat composer (`ChatInputWithMentions`): @-mentions over knowledge
-notes, attachments, model/effort picker, search/code/permission toggles.
-Type — or hold Right ⌘ for local dictation (DOM events; the bar has
-focus, no Input Monitoring needed) — and the submit relays through main
-into the current chat with the FULL composer payload (`quickAsk:submit`
-→ `quick-ask:submit` → `handlePromptSubmit`, with the bar's model/effort
-applied to the active tab first); the answer mirrors back over
-`quickAsk:state` → `quick-ask:state` (streaming text from
-`currentAssistantMessage`, final text from the conversation — only
-messages timestamped after the submit count), and `quickAsk:stop` relays
-the composer's Stop. The window is hidden, not destroyed, on dismiss
-(blur or Esc). Geometry: a FIXED tall transparent frame — only the
-bottom card paints; composer popovers open upward into the transparent
-zone, a click there dismisses, and no window resizing happens in this
-mode.
+The Skipper's card hosts the REAL chat composer
+(`ChatInputWithMentions`): @-mentions over knowledge notes, attachments,
+model/effort picker, search/code/permission toggles. A submit relays
+through main with the FULL payload (`quickAsk:submit` →
+`quick-ask:submit` → `handleHoverSubmit`) into the COMPANION's session —
+never the app window's chat — and the reply comes back through the same
+call mirror a spoken one does (`video:popoutState` → `video:popout-state`),
+so there is no second answer channel. Speech follows the QUESTION's
+modality: typed questions render silently, spoken ones are read aloud,
+plus the explicit speaker mute on the card.
 
-**Optional toggles** (`quickAsk:setOptions` → `quick-ask:set-options`;
-actual state echoes back over `quickAsk:optionsState` →
-`quick-ask:options-state`): **voice response** speaks the bar's answers
-aloud — per-turn (`speakTurnRef` set at submit for quick-ask turns), so
-composer messages outside the bar never start talking; the segment player
-and fallback-speech net honor it. **Screen share** reuses the call
-engine's capture wholesale (`video.start({camera:false})` +
-`startScreenShare`, black-frame permission check included): frames ride
-along with bar submits and `composition.videoMode` is set. The bar owns
-the consent surface outside calls — a lit share toggle with a pulsing dot
-is the badge, no floating pill appears, and the share STOPS whenever the
-bar goes away (blur, Esc, the Open-in-Rowboat jump). Bar toggles never
-touch devices while a call is live.
+The strip above the composer carries the destination chip (which chat
+this session continues, with a recents switcher and Command Center
+first), new-chat, the history peek, the speaker mute, and Open-in-Rowboat.
+Device controls (mic, share, end) live on the mascot's pins, in both the
+open and tucked states.
+
+**Retired** (2026-08): the `summoned` role — a standalone Spotlight-style
+ask bar with its own answer panel (`quickAsk:state`), local dictation
+(`quick-ask:summoned` hold-to-talk), Stop relay (`quickAsk:stop`),
+dismiss (`quickAsk:hide` / blur), and voice-out + share-without-a-call
+toggles (`quickAsk:setOptions` / `quickAsk:optionsState`). Those channels
+and their App-side plumbing (`speakTurnRef`, `quickAskActiveRef`,
+`quickAskOptionsRef`) are gone. ⌥⇧Space has exactly ONE outcome now, so
+there is no second layout to flash, race, or get stuck in. A summon that
+can't become a session (voice unconfigured, or the engine failed to
+start) is explained in the APP window — brought to the front with a toast
+that opens Settings — never by showing a different floating surface.
 
 ## Cost notes
 

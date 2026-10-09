@@ -124,6 +124,7 @@ export type AppView =
   | 'code'
   | 'bg-tasks'
   | 'apps'
+  | 'spaces'
 
 // Views that count as "using a feature" — first visit sets a person property
 // so PostHog cohorts can answer "how many people have ever used meetings".
@@ -134,6 +135,7 @@ const FIRST_USE_VIEWS: Partial<Record<AppView, string>> = {
   'bg-tasks': 'has_used_bg_agents',
   apps: 'has_used_apps',
   code: 'has_used_code',
+  spaces: 'has_used_spaces',
 }
 
 export function viewOpened(view: AppView) {
@@ -201,6 +203,71 @@ export function emailSyncTriggered() {
 }
 
 // --- Meetings ---
+
+// --- Spaces ---------------------------------------------------------------
+
+export function spacesServerCreated() {
+  posthog.capture('spaces_server_created')
+}
+
+export function spacesSpaceCreated() {
+  posthog.capture('spaces_space_created')
+}
+
+export function spacesInviteLinkCopied() {
+  posthog.capture('spaces_invite_link_copied')
+}
+
+// Counts successful join/connect actions; address and dev flows can reconnect
+// existing members. The method identifies the UI flow, not the server's host.
+export function spacesSpaceJoined(method: 'invite_link' | 'server_address' | 'dev_server') {
+  posthog.capture('spaces_space_joined', { method })
+}
+
+export function spacesRowboatInvokeFailed() {
+  posthog.capture('spaces_rowboat_invoke_failed')
+}
+
+export function spacesMessagePosted(props: { kind: 'general' | 'topic'; mentionsRowboat: boolean }) {
+  posthog.capture('spaces_message_posted', { kind: props.kind, mentions_rowboat: props.mentionsRowboat })
+}
+
+// Auto's tag chips (2026-09-24): every gesture is a signal for the threshold,
+// since Jev learns nothing from them on its own. One event per chip gesture,
+// and one per confirmed send with the counts of what was shown.
+export function spacesAutoTagChip(props: { action: 'accept' | 'remove' | 'decline'; kind: 'member' | 'here' }) {
+  posthog.capture('spaces_auto_tag_chip', props)
+}
+
+export function spacesAutoTagsSent(props: { shown: number; accepted: number; declined: number; ignored: number }) {
+  posthog.capture('spaces_auto_tags_sent', props)
+}
+
+// /find (2026-09-24): how often the first pick is right is the number that
+// says whether "take me there" beats a results list.
+export function spacesFind(props: { outcome: 'landed' | 'not-found' | 'no-key' | 'error' | 'next' | 'search-instead' }) {
+  posthog.capture('spaces_find', props)
+}
+
+export function spacesReactionToggled(props: { action: 'add' | 'remove' }) {
+  posthog.capture('spaces_reaction_toggled', { action: props.action })
+}
+
+export function spacesMessageDeleted() {
+  posthog.capture('spaces_message_deleted')
+}
+
+export function spacesTopicStarted() {
+  posthog.capture('spaces_topic_started')
+}
+
+export function spacesFoldRequested() {
+  posthog.capture('spaces_fold_requested')
+}
+
+export function spacesTabViewed(tab: 'general' | 'topics' | 'files' | 'whiteboard') {
+  posthog.capture('spaces_tab_viewed', { tab })
+}
 
 export function meetingRecordingStarted(hasCalendarEvent: boolean) {
   posthog.capture('meeting_recording_started', { has_calendar_event: hasCalendarEvent })

@@ -3,9 +3,11 @@ import { reduceTurn } from '@x/shared/src/turns.js'
 import { isChatMessage, isErrorMessage, isReasoningMessage, isToolCall, isTurnUsageMessage } from '@/lib/chat-conversation'
 import {
   applyOverlay,
+  assistantMessageId,
   buildSessionChatState,
   buildTurnConversation,
   emptyOverlay,
+  reasoningMessageId,
 } from './turn-view'
 import {
   TS,
@@ -298,14 +300,14 @@ describe('buildTurnConversation', () => {
       progress: progress as never,
     })
     const ask = { toolCallId: 'x', title: 'write file', options: [] }
-    // resolved: the durable marker pairs off the request mid-run
+    // resolved: the durable marker pairs off the request it names
     const resolvedState = reduceTurn([
       created(T1, S1),
       requested(T1, 0),
       completed(T1, 0, assistantCalls(toolCallPart('cr1', 'code_agent_run'))),
       invocation(T1, 'cr1', 'code_agent_run'),
       codeProgress('cr1', { kind: 'code-run-permission-request', requestId: 'cpr-1', ask }),
-      codeProgress('cr1', { kind: 'code-run-permission-resolved' }),
+      codeProgress('cr1', { kind: 'code-run-permission-resolved', requestId: 'cpr-1' }),
     ])
     const resolved = buildTurnConversation(resolvedState).filter(isToolCall)[0]
     expect(resolved.pendingCodePermission).toBeUndefined()
@@ -317,11 +319,23 @@ describe('buildTurnConversation', () => {
       completed(T1, 0, assistantCalls(toolCallPart('cr1', 'code_agent_run'))),
       invocation(T1, 'cr1', 'code_agent_run'),
       codeProgress('cr1', { kind: 'code-run-permission-request', requestId: 'cpr-1', ask }),
-      codeProgress('cr1', { kind: 'code-run-permission-resolved' }),
+      codeProgress('cr1', { kind: 'code-run-permission-resolved', requestId: 'cpr-1' }),
       codeProgress('cr1', { kind: 'code-run-permission-request', requestId: 'cpr-2', ask }),
     ])
     const secondAsk = buildTurnConversation(secondAskState).filter(isToolCall)[0]
     expect(secondAsk.pendingCodePermission?.requestId).toBe('cpr-2')
+
+    // an id-less marker (pre-2026-09-23 logs) still clears the oldest ask
+    const legacyState = reduceTurn([
+      created(T1, S1),
+      requested(T1, 0),
+      completed(T1, 0, assistantCalls(toolCallPart('cr1', 'code_agent_run'))),
+      invocation(T1, 'cr1', 'code_agent_run'),
+      codeProgress('cr1', { kind: 'code-run-permission-request', requestId: 'cpr-1', ask }),
+      codeProgress('cr1', { kind: 'code-run-permission-resolved' }),
+    ])
+    const legacy = buildTurnConversation(legacyState).filter(isToolCall)[0]
+    expect(legacy.pendingCodePermission).toBeUndefined()
 
     // settled: an unanswered ask must not survive the tool's terminal result
     const settledState = reduceTurn([
@@ -335,6 +349,70 @@ describe('buildTurnConversation', () => {
     const settled = buildTurnConversation(settledState).filter(isToolCall)[0]
     expect(settled.pendingCodePermission).toBeUndefined()
     expect(settled.status).toBe('completed')
+  })
+
+  it('keeps a later ask visible after unpaired resolutions', () => {
+    // The shape real logs had once a run auto-approved anything (one ask, then
+    // a run of resolutions with no request behind them). Counting resolutions
+    // against asks made the tally negative, so the next genuine ask rendered no
+    // card while the coding agent sat blocked on it (2026-09-23).
+    const codeProgress = (progress: unknown): TEvent => ({
+      type: 'tool_progress',
+      turnId: T1,
+      ts: TS,
+      toolCallId: 'cr1',
+      source: 'sync',
+      progress: progress as never,
+    })
+    const ask = { toolCallId: 'x', title: 'git push', options: [] }
+    const state = reduceTurn([
+      created(T1, S1),
+      requested(T1, 0),
+      completed(T1, 0, assistantCalls(toolCallPart('cr1', 'code_agent_run'))),
+      invocation(T1, 'cr1', 'code_agent_run'),
+      codeProgress({ kind: 'code-run-permission-request', requestId: 'cpr-1', ask }),
+      codeProgress({ kind: 'code-run-permission-resolved', requestId: 'cpr-1' }),
+      // stale ids: the auto path no longer emits these, but an unknown id must
+      // never consume a pending ask either
+      codeProgress({ kind: 'code-run-permission-resolved', requestId: 'cpr-stale-1' }),
+      codeProgress({ kind: 'code-run-permission-resolved', requestId: 'cpr-stale-2' }),
+      codeProgress({ kind: 'code-run-permission-request', requestId: 'cpr-2', ask }),
+    ])
+    const tool = buildTurnConversation(state).filter(isToolCall)[0]
+    expect(tool.pendingCodePermission?.requestId).toBe('cpr-2')
+  })
+
+  it('surfaces concurrent asks oldest-first, one at a time', () => {
+    // The ACP transport dispatches requests concurrently, so a coding agent can
+    // have several asks in flight. Answering the visible one must surface the
+    // next, not leave the run blocked on an ask that never had a card.
+    const codeProgress = (progress: unknown): TEvent => ({
+      type: 'tool_progress',
+      turnId: T1,
+      ts: TS,
+      toolCallId: 'cr1',
+      source: 'sync',
+      progress: progress as never,
+    })
+    const ask = { toolCallId: 'x', title: 'write file', options: [] }
+    const head = [
+      created(T1, S1),
+      requested(T1, 0),
+      completed(T1, 0, assistantCalls(toolCallPart('cr1', 'code_agent_run'))),
+      invocation(T1, 'cr1', 'code_agent_run'),
+      codeProgress({ kind: 'code-run-permission-request', requestId: 'cpr-1', ask }),
+      codeProgress({ kind: 'code-run-permission-request', requestId: 'cpr-2', ask }),
+    ]
+    const both = buildTurnConversation(reduceTurn(head)).filter(isToolCall)[0]
+    expect(both.pendingCodePermission?.requestId).toBe('cpr-1')
+
+    const answeredFirst = buildTurnConversation(
+      reduceTurn([
+        ...head,
+        codeProgress({ kind: 'code-run-permission-resolved', requestId: 'cpr-1' }),
+      ]),
+    ).filter(isToolCall)[0]
+    expect(answeredFirst.pendingCodePermission?.requestId).toBe('cpr-2')
   })
 
   it('derives the sub-agent child link from spawn-agent progress', () => {
@@ -735,6 +813,115 @@ describe('buildSessionChatState', () => {
     const state = buildSessionChatState([turn], { ...emptyOverlay(), text: 'typing…' })
     expect(state.currentAssistantMessage).toBe('typing…')
     expect(state.isReasoning).toBe(false)
+  })
+
+  it('renders the live text as a synthetic trailing item under the durable id', () => {
+    const turn = reduceTurn([created(T1, S1), requested(T1, 0)])
+    const state = buildSessionChatState([turn], { ...emptyOverlay(), text: 'typing…' })
+    const last = state.conversation[state.conversation.length - 1]
+    expect(last).toMatchObject({
+      id: assistantMessageId(T1, 0),
+      role: 'assistant',
+      content: 'typing…',
+      streaming: true,
+    })
+
+    // Completion must yield a durable item under the SAME id — any drift
+    // between the two derivations reintroduces the unmount/remount flash.
+    const done = reduceTurn([
+      created(T1, S1),
+      requested(T1, 0),
+      completed(T1, 0, assistantText('typed all of it')),
+    ])
+    const settled = buildSessionChatState([done], emptyOverlay())
+    const durable = settled.conversation
+      .filter(isChatMessage)
+      .find((m) => m.role === 'assistant')
+    expect(durable?.id).toBe(assistantMessageId(T1, 0))
+    expect(durable?.streaming).toBeUndefined()
+    expect(
+      settled.conversation.filter(
+        (item) => 'id' in item && item.id === assistantMessageId(T1, 0),
+      ),
+    ).toHaveLength(1)
+  })
+
+  it('renders live reasoning as a synthetic item under the durable id, shimmering', () => {
+    const turn = reduceTurn([
+      created(T1, S1),
+      requested(T1, 0),
+      modelStep(T1, 0, { type: 'reasoning_start' }),
+    ])
+    const state = buildSessionChatState([turn], { ...emptyOverlay(), reasoning: 'hmm…' })
+    const last = state.conversation[state.conversation.length - 1]
+    expect(last).toMatchObject({
+      id: reasoningMessageId(T1, 0),
+      kind: 'reasoning',
+      content: 'hmm…',
+      streaming: true,
+    })
+  })
+
+  it('live reasoning stops shimmering and precedes the answer once text streams', () => {
+    const turn = reduceTurn([
+      created(T1, S1),
+      requested(T1, 0),
+      modelStep(T1, 0, { type: 'reasoning_start' }),
+      modelStep(T1, 0, { type: 'reasoning_end', text: 'done reasoning' }),
+    ])
+    const state = buildSessionChatState([turn], {
+      ...emptyOverlay(),
+      reasoning: 'done reasoning',
+      text: 'answer…',
+    })
+    const ids = state.conversation.map((item) => item.id)
+    expect(ids.indexOf(reasoningMessageId(T1, 0))).toBeLessThan(
+      ids.indexOf(assistantMessageId(T1, 0)),
+    )
+    const reasoningItem = state.conversation.find(isReasoningMessage)
+    expect(reasoningItem?.streaming).toBe(false)
+  })
+
+  it('a later model call streams under its own index; earlier segments stay durable', () => {
+    const turn = reduceTurn([
+      created(T1, S1),
+      requested(T1, 0),
+      completed(T1, 0, assistantText('first segment')),
+      requested(T1, 1, ['assistant:0']),
+    ])
+    const state = buildSessionChatState([turn], { ...emptyOverlay(), text: 'second…' })
+    const last = state.conversation[state.conversation.length - 1]
+    expect(last).toMatchObject({ id: assistantMessageId(T1, 1), streaming: true })
+    const first = state.conversation
+      .filter(isChatMessage)
+      .find((m) => m.id === assistantMessageId(T1, 0))
+    expect(first?.content).toBe('first segment')
+    expect(first?.streaming).toBeUndefined()
+  })
+
+  it('emits no synthetic items once the turn settles, and none without live text', () => {
+    const settled = buildSessionChatState(
+      [
+        reduceTurn([
+          created(T1, S1),
+          requested(T1, 0),
+          completed(T1, 0, assistantText('done')),
+          turnCompleted(T1, 'done'),
+        ]),
+      ],
+      emptyOverlay(),
+    )
+    expect(
+      settled.conversation.some((item) => (item as { streaming?: boolean }).streaming),
+    ).toBe(false)
+
+    const quiet = buildSessionChatState(
+      [reduceTurn([created(T1, S1), requested(T1, 0)])],
+      emptyOverlay(),
+    )
+    expect(
+      quiet.conversation.some((item) => (item as { streaming?: boolean }).streaming),
+    ).toBe(false)
   })
 
   it('surfaces streaming reasoning as currentReasoning', () => {

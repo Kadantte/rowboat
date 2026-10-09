@@ -1,6 +1,7 @@
 import { app, autoUpdater, net, nativeImage, BrowserWindow } from "electron";
 import { capture } from "@x/core/dist/analytics/posthog.js";
 import type { ipc } from "@x/shared";
+import { setDockUpdateReady } from './dock-badge.js';
 
 export type UpdaterStatus = ipc.IPCChannels["updater:status"]["req"];
 
@@ -9,6 +10,8 @@ const CHECK_INTERVAL_MS = 10 * 60 * 1000;
 
 let status: UpdaterStatus = { state: "disabled", version: "", reason: "dev" };
 
+const statusListeners = new Set<(status: UpdaterStatus) => void>();
+
 function setStatus(next: Omit<UpdaterStatus, "version">): void {
   status = { version: status.version, ...next };
   for (const win of BrowserWindow.getAllWindows()) {
@@ -16,10 +19,21 @@ function setStatus(next: Omit<UpdaterStatus, "version">): void {
       win.webContents.send("updater:status", status);
     }
   }
+  for (const listener of statusListeners) listener(status);
 }
 
 export function getUpdaterStatus(): UpdaterStatus {
   return status;
+}
+
+/**
+ * Main-process subscription to updater state changes — the application menu
+ * relabels its "Check for Updates…" item on each transition (menu.ts).
+ * Returns an unsubscribe function.
+ */
+export function onUpdaterStatusChanged(listener: (status: UpdaterStatus) => void): () => void {
+  statusListeners.add(listener);
+  return () => statusListeners.delete(listener);
 }
 
 // 32x32 green dot with a white ring (scratchpad-generated PNG). Windows'
@@ -32,7 +46,7 @@ function showReadyBadge(): void {
   if (process.platform === "darwin") {
     // The window may be closed for days on macOS (app keeps running) — the
     // dock badge is the only surface that says "an update is waiting".
-    app.dock?.setBadge("1");
+    setDockUpdateReady();
   } else if (process.platform === "win32") {
     const badge = nativeImage.createFromDataURL(WIN_BADGE_DATA_URL);
     for (const win of BrowserWindow.getAllWindows()) {

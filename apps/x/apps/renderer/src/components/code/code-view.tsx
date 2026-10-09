@@ -1,17 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ChevronDown, ChevronUp, Code2, GitBranch, Terminal as TerminalIcon } from 'lucide-react'
-import type { CodeSession, CodeSessionStatus, CodeAgentModelOptions } from '@x/shared/src/code-sessions.js'
-import { fetchCodeAgentOptions, toSelectorOptions, withDefault, optionLabel } from './code-agent-options'
-import { ModelSelector } from '@/components/model-selector'
-import type { ApprovalPolicy } from '@x/shared/src/code-mode.js'
+import { FolderOpen, Plus } from 'lucide-react'
+import { codeWorkspaceKey, type CodeSession, type CodeSessionStatus } from '@x/shared/src/code-sessions.js'
+import type { CodingAgent } from '@x/shared/src/code-mode.js'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -22,19 +14,15 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { useCodeSessions } from './use-code-sessions'
+import { useCodeSessions, projectLabel, type ProjectRow } from './use-code-sessions'
 import { SessionRail } from './session-rail'
-import { NewSessionDialog } from './new-session-dialog'
-import { WorkspacePane } from './workspace-pane'
-import { TerminalPane } from './terminal-pane'
+import { useCodeSessionReader } from './session-read-state'
+import { BranchDialog } from './branch-dialog'
+import { fetchCodeAgentsStatus, isAgentReady, type CodeAgentsStatus } from './code-agent-status'
 
-const TERMINAL_HEIGHT_STORAGE_KEY = 'x:code-terminal-height'
-const TERMINAL_MIN_HEIGHT = 120
-const TERMINAL_MAX_HEIGHT = 600
-
-// Remember which session was open so leaving the Code section (which unmounts
+// Remember which session was open so leaving Projects (which unmounts
 // this view) and coming back restores the selection — and with it the chat
-// output in the right pane — instead of dropping back to the empty state.
+// bound to it — instead of dropping back to the empty state.
 const SELECTED_SESSION_STORAGE_KEY = 'x:code-selected-session'
 
 function readStoredSelectedSessionId(): string | null {
@@ -42,49 +30,32 @@ function readStoredSelectedSessionId(): string | null {
   return window.localStorage.getItem(SELECTED_SESSION_STORAGE_KEY) || null
 }
 
-function readStoredTerminalHeight(): number {
-  if (typeof window === 'undefined') return 240
-  const raw = Number(window.localStorage.getItem(TERMINAL_HEIGHT_STORAGE_KEY))
-  if (!Number.isFinite(raw) || raw <= 0) return 240
-  return Math.min(TERMINAL_MAX_HEIGHT, Math.max(TERMINAL_MIN_HEIGHT, raw))
-}
-
-const AGENT_LABEL: Record<string, string> = { claude: 'Claude Code', codex: 'Codex' }
-const POLICY_LABEL: Record<ApprovalPolicy, string> = {
-  ask: 'Ask every time',
-  'auto-approve-reads': 'Auto-approve reads',
-  yolo: 'Auto-approve everything',
-}
-const POLICY_HEADER_LABEL: Record<ApprovalPolicy, string> = {
-  ask: 'Ask',
-  'auto-approve-reads': 'Auto reads',
-  yolo: 'Auto all',
-}
-
 export interface ActiveCodeSession {
   session: CodeSession
   status: CodeSessionStatus
 }
 
-// The Code section's middle pane: session rail + workspace (diffs/files).
-// The conversation lives in the RIGHT pane — the assistant chat bound to the
-// session (a code session IS a chat session). App.tsx learns which via
-// onSessionSelected and binds the right pane.
+// Projects uses the existing session store (its Code names remain compatible
+// with saved sessions and routes). The rail selects a thread, its conversation
+// fills the main surface, and the terminal opens beside it.
 export function CodeView({
   onSessionSelected,
-  openDiffPath,
-  onDiffOpened,
   focusSessionId,
   onFocusConsumed,
+  onRailWidthChange,
+  focusProjectPath,
+  onProjectFocusConsumed,
 }: {
   onSessionSelected?: (active: ActiveCodeSession | null) => void
-  // A file path the chat asked to review (clicking a changed file in a tool call).
-  openDiffPath?: string | null
-  onDiffOpened?: () => void
   // Deep-link from elsewhere (a Home Deck strip): select this session on
   // mount/change instead of the remembered one.
   focusSessionId?: string | null
   onFocusConsumed?: () => void
+  // The rail's drag-resizable width, reported up so App can size the middle
+  // pane to the rail while a session's chat is the main surface.
+  onRailWidthChange?: (width: number) => void
+  focusProjectPath?: string | null
+  onProjectFocusConsumed?: () => void
 }) {
   const { projects, sessions, statusOf, refresh } = useCodeSessions()
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(readStoredSelectedSessionId)
@@ -94,65 +65,64 @@ export function CodeView({
     setSelectedSessionId(focusSessionId)
     onFocusConsumed?.()
   }, [focusSessionId, onFocusConsumed])
-  const [newSessionProjectId, setNewSessionProjectId] = useState<string | null>(null)
+  const [branchDialog, setBranchDialog] = useState<{ projectId: string; mode: 'switch' } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<CodeSession | null>(null)
-  const [terminalOpen, setTerminalOpen] = useState(false)
-  const [terminalHeight, setTerminalHeight] = useState(readStoredTerminalHeight)
-  const dragStateRef = useRef<{ startY: number; startHeight: number } | null>(null)
 
+  // Warm the agent probe so a quick-create doesn't pay for it on the click.
+  const [agentsStatus, setAgentsStatus] = useState<CodeAgentsStatus | null>(null)
   useEffect(() => {
-    window.localStorage.setItem(TERMINAL_HEIGHT_STORAGE_KEY, String(terminalHeight))
-  }, [terminalHeight])
+    let cancelled = false
+    fetchCodeAgentsStatus().then((s) => { if (!cancelled) setAgentsStatus(s) }).catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   useEffect(() => {
     if (selectedSessionId) window.localStorage.setItem(SELECTED_SESSION_STORAGE_KEY, selectedSessionId)
     else window.localStorage.removeItem(SELECTED_SESSION_STORAGE_KEY)
   }, [selectedSessionId])
 
-  const handleTerminalDragStart = useCallback((e: React.MouseEvent) => {
-    e.preventDefault()
-    dragStateRef.current = { startY: e.clientY, startHeight: terminalHeight }
-    const onMove = (event: MouseEvent) => {
-      const drag = dragStateRef.current
-      if (!drag) return
-      // Terminal sits at the bottom: dragging up grows it.
-      const next = drag.startHeight + (drag.startY - event.clientY)
-      setTerminalHeight(Math.min(TERMINAL_MAX_HEIGHT, Math.max(TERMINAL_MIN_HEIGHT, next)))
-    }
-    const onUp = () => {
-      dragStateRef.current = null
-      document.removeEventListener('mousemove', onMove)
-      document.removeEventListener('mouseup', onUp)
-    }
-    document.addEventListener('mousemove', onMove)
-    document.addEventListener('mouseup', onUp)
-  }, [terminalHeight])
-
   const selectedSession = sessions.find((s) => s.id === selectedSessionId) ?? null
   const selectedStatus = selectedSession ? statusOf(selectedSession.id) : 'idle'
-  const newSessionProject = projects.find((p) => p.project.id === newSessionProjectId) ?? null
+  useCodeSessionReader(focusSessionId ? null : selectedSession?.id ?? null)
 
-  // Live model/effort choices for the selected session's agent, for the header
-  // pickers. Discovered from the engine and cached, so this is cheap to re-run.
-  const [modelOpts, setModelOpts] = useState<CodeAgentModelOptions>({ models: [], efforts: [] })
-  const selectedAgent = selectedSession?.agent
   useEffect(() => {
-    if (!selectedAgent) { setModelOpts({ models: [], efforts: [] }); return }
-    let cancelled = false
-    void fetchCodeAgentOptions(selectedAgent).then((opts) => { if (!cancelled) setModelOpts(opts) })
-    return () => { cancelled = true }
-  }, [selectedAgent])
+    if (selectedSession) window.localStorage.setItem(`x:code-workspace-session:${codeWorkspaceKey(selectedSession)}`, selectedSession.id)
+  }, [selectedSession])
 
-  // Tell App which session (and status) owns the right-hand chat pane.
+  // Tell App which session (and status) owns the chat.
   useEffect(() => {
     onSessionSelected?.(selectedSession ? { session: selectedSession, status: selectedStatus } : null)
   }, [selectedSession, selectedStatus, onSessionSelected])
 
-  // Leaving the Code section unmounts this view — release the right pane.
+  // Leaving Projects unmounts this view — release the chat.
   useEffect(() => {
     return () => onSessionSelected?.(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  const creatingRef = useRef(false)
+
+  // Create immediately from the live parent checkout. The base can be changed
+  // from the worktree controls until its first session starts.
+  const handleNewSession = useCallback(async (projectId: string, agentOverride?: CodingAgent, projectRow?: ProjectRow) => {
+    if (creatingRef.current) return
+    const row = projectRow ?? projects.find((p) => p.project.id === projectId)
+    if (!row) return
+    creatingRef.current = true
+    try {
+      const lastUsed = [...sessions]
+        .sort((a, b) => (b.lastActivityAt ?? b.createdAt).localeCompare(a.lastActivityAt ?? a.createdAt))[0]?.agent
+      const agent: CodingAgent = agentOverride ?? lastUsed ?? (isAgentReady(agentsStatus, 'claude') ? 'claude' : 'codex')
+      const isolation = row.git.isGitRepo ? 'worktree' : 'in-repo'
+      const res = await window.ipc.invoke('codeSession:create', { projectId, agent, isolation, codeModeEnabled: row.git.isGitRepo || !!agentOverride })
+      await refresh()
+      setSelectedSessionId(res.session.id)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to create session')
+    } finally {
+      creatingRef.current = false
+    }
+  }, [projects, sessions, agentsStatus, refresh])
 
   const handleAddProject = useCallback(async () => {
     const res = await window.ipc.invoke('dialog:openDirectory', { title: 'Choose a project folder' })
@@ -161,21 +131,54 @@ export function CodeView({
     try {
       const added = await window.ipc.invoke('codeProject:add', { path: dir })
       await refresh()
-      setNewSessionProjectId(added.project.id)
+      // Use the returned row directly: the refreshed React snapshot may not
+      // have rendered yet when a project is first added.
+      await handleNewSession(added.project.id, undefined, added)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to add project')
     }
-  }, [refresh])
+  }, [refresh, handleNewSession])
+
+  useEffect(() => {
+    if (!focusProjectPath) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const row = await window.ipc.invoke('codeProject:add', { path: focusProjectPath })
+        await refresh()
+        if (cancelled) return
+        const existing = await window.ipc.invoke('codeSession:list', null)
+        const session = existing.sessions.find((s) => s.projectId === row.project.id && !s.doneAt)
+        if (session) setSelectedSessionId(session.id)
+        else await handleNewSession(row.project.id, undefined, row)
+        onProjectFocusConsumed?.()
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Failed to open project')
+        onProjectFocusConsumed?.()
+      }
+    })()
+    return () => { cancelled = true }
+    // A directory request is consumed once, independently of store refreshes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusProjectPath])
 
   const handleRemoveProject = useCallback(async (projectId: string) => {
     await window.ipc.invoke('codeProject:remove', { projectId })
     await refresh()
   }, [refresh])
 
-  const handleSessionCreated = useCallback(async (session: CodeSession) => {
-    await refresh()
-    setSelectedSessionId(session.id)
-  }, [refresh])
+  // The rail acts on the whole workspace; the chat header can still mark
+  // an individual session done. Files and conversations remain on disk.
+  const handleSetDone = useCallback(async (session: CodeSession, done: boolean) => {
+    try {
+      for (const member of sessions.filter((s) => codeWorkspaceKey(s) === codeWorkspaceKey(session))) {
+        await window.ipc.invoke('codeSession:setDone', { sessionId: member.id, done })
+      }
+      await refresh()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to update session')
+    }
+  }, [refresh, sessions])
 
   const handleDeleteSession = useCallback(async (session: CodeSession, removeWorktree: boolean) => {
     try {
@@ -184,206 +187,85 @@ export function CodeView({
         removeWorktree,
         deleteBranch: removeWorktree,
       })
-      if (selectedSessionId === session.id) setSelectedSessionId(null)
+      if (selectedSessionId === session.id) setSelectedSessionId(sessions.find((s) => s.id !== session.id && codeWorkspaceKey(s) === codeWorkspaceKey(session))?.id ?? null)
       await refresh()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to delete session')
     }
-  }, [refresh, selectedSessionId])
-
-  const handleUpdateSession = useCallback(async (patch: { policy?: ApprovalPolicy; agent?: 'claude' | 'codex'; agentModel?: string; agentEffort?: string }) => {
-    if (!selectedSessionId) return
-    try {
-      await window.ipc.invoke('codeSession:update', { sessionId: selectedSessionId, patch })
-      await refresh()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to update session')
-    }
-  }, [refresh, selectedSessionId])
+  }, [refresh, selectedSessionId, sessions])
 
   return (
     <div className="flex h-full min-h-0">
-      {/* Session rail */}
-      <div className="w-64 shrink-0 border-r">
-        <SessionRail
-          projects={projects}
-          sessions={sessions}
-          statusOf={statusOf}
-          selectedSessionId={selectedSessionId}
-          onSelectSession={(id) => {
-            setSelectedSessionId(id)
-            // Re-clicking the already-selected session is a no-op for React
-            // state, but the user means "show me this session's chat" — the
-            // dock may have been rebound to another conversation meanwhile.
-            // Re-notify so App re-asserts the binding (it dedupes).
-            if (id === selectedSessionId) {
-              const session = sessions.find((s) => s.id === id)
-              if (session) onSessionSelected?.({ session, status: statusOf(session.id) })
-            }
-          }}
-          onAddProject={() => void handleAddProject()}
-          onRemoveProject={(id) => void handleRemoveProject(id)}
-          onNewSession={setNewSessionProjectId}
-          onDeleteSession={setDeleteTarget}
-        />
-      </div>
-
-      {/* Workspace: session header + diffs/files. The chat is in the right pane. */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        {selectedSession ? (
-          <>
-            <div className="flex flex-wrap items-start gap-x-3 gap-y-2 border-b px-4 py-2.5">
-              <div className="min-w-64 flex-[1_1_360px]">
-                <div className="truncate text-sm font-medium">{selectedSession.title}</div>
-                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
-                  <span className="shrink-0 whitespace-nowrap">{AGENT_LABEL[selectedSession.agent]}</span>
-                  <span className="shrink-0 text-muted-foreground/50">·</span>
-                  <span className="min-w-0 max-w-full flex-1 truncate font-mono" title={selectedSession.cwd}>{selectedSession.cwd}</span>
-                  {selectedSession.worktree && !selectedSession.worktree.removedAt && (
-                    <span className="flex min-w-0 max-w-72 shrink items-center gap-1 rounded-full bg-muted px-1.5 py-0.5">
-                      <GitBranch className="size-3" />
-                      <span className="truncate">{selectedSession.worktree.branch}</span>
-                    </span>
-                  )}
-                </div>
-              </div>
-              <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-2">
-                <ModelSelector
-                  triggerTitle="Coding agent model"
-                  defaultOption={{ label: toSelectorOptions(modelOpts.models).defaultLabel }}
-                  staticOptions={toSelectorOptions(modelOpts.models).options}
-                  value={selectedSession.agentModel && selectedSession.agentModel !== 'default'
-                    ? { provider: '', model: selectedSession.agentModel }
-                    : null}
-                  onChange={(ref) => void handleUpdateSession({ agentModel: ref?.model ?? 'default' })}
-                />
-                {modelOpts.efforts.length > 0 && (
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 gap-1.5 px-2 text-xs text-muted-foreground"
-                        title="Reasoning effort"
-                      >
-                        <span className="whitespace-nowrap">{optionLabel(modelOpts.efforts, selectedSession.agentEffort)}</span>
-                        <ChevronDown className="size-3" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      {withDefault(modelOpts.efforts).map((e) => (
-                        <DropdownMenuItem key={e.value} onClick={() => void handleUpdateSession({ agentEffort: e.value })}>
-                          {e.label}
-                          {(selectedSession.agentEffort ?? 'default') === e.value && <span className="ml-auto">✓</span>}
-                        </DropdownMenuItem>
-                      ))}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                )}
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 gap-1.5 px-2 text-xs text-muted-foreground"
-                      title={selectedSession.policy
-                        ? POLICY_LABEL[selectedSession.policy]
-                        : 'Approvals: Auto — follows the composer chip / global setting until you pick one here'}
-                    >
-                      <span className="whitespace-nowrap">{selectedSession.policy ? POLICY_HEADER_LABEL[selectedSession.policy] : 'Auto'}</span>
-                      <ChevronDown className="size-3" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    {(Object.keys(POLICY_LABEL) as ApprovalPolicy[]).map((policy) => (
-                      <DropdownMenuItem key={policy} onClick={() => void handleUpdateSession({ policy })}>
-                        {POLICY_LABEL[policy]}
-                        {selectedSession.policy === policy && <span className="ml-auto">✓</span>}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            </div>
-            <div className="min-h-0 flex-1">
-              <WorkspacePane
-                session={selectedSession}
-                status={selectedStatus}
-                openDiffPath={openDiffPath ?? null}
-                onDiffOpened={() => onDiffOpened?.()}
-                onSessionChanged={() => void refresh()}
-              />
-            </div>
-
-            {/* Embedded terminal — a real shell in the session's directory
-                (worktree included). The PTY lives in the main process and
-                survives collapsing this panel. */}
-            <div className="shrink-0 border-t">
-              {terminalOpen && (
-                <div
-                  onMouseDown={handleTerminalDragStart}
-                  className="h-1 cursor-row-resize bg-transparent transition-colors hover:bg-sidebar-border"
-                />
-              )}
-              <button
-                type="button"
-                onClick={() => setTerminalOpen((v) => !v)}
-                className="flex w-full items-center gap-1.5 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-              >
-                <TerminalIcon className="size-3.5" />
-                <span className="font-medium">Terminal</span>
-                {selectedSession.worktree && !selectedSession.worktree.removedAt && (
-                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px]">worktree</span>
-                )}
-                <span className="flex-1" />
-                {terminalOpen ? <ChevronDown className="size-3.5" /> : <ChevronUp className="size-3.5" />}
-              </button>
-              {terminalOpen && (
-                <div className="bg-background pb-3 dark:bg-black" style={{ height: terminalHeight + 12 }}>
-                  <div className="h-full min-h-0">
-                    <TerminalPane
-                      key={selectedSession.id}
-                      terminalId={selectedSession.id}
-                      cwd={selectedSession.cwd}
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-          </>
-        ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-            <Code2 className="size-10 text-muted-foreground/40" />
-            <div className="text-sm font-medium">Code with agents</div>
-            <p className="max-w-sm px-6 text-xs text-muted-foreground">
-              Rowboat runs Claude Code or Codex on your projects. Chat on the right like any other
-              conversation — changes and files show here.
-            </p>
-            {projects.length === 0 ? (
-              <Button size="sm" onClick={() => void handleAddProject()}>Add a project to get started</Button>
-            ) : (
-              <p className="text-xs text-muted-foreground">Pick a session on the left, or create a new one.</p>
-            )}
-          </div>
-        )}
-      </div>
-
-      <NewSessionDialog
-        projectRow={newSessionProject}
-        open={newSessionProjectId !== null}
-        onOpenChange={(open) => { if (!open) setNewSessionProjectId(null) }}
-        onCreated={(session) => void handleSessionCreated(session)}
+      {/* Session rail, on the shared SecondaryRail shell (it owns its width
+          and drag-resize). With a session selected this IS the middle pane —
+          App sizes the pane to the width the rail reports; without one the
+          empty state fills the rest and the chat pane stays out of the way. */}
+      <SessionRail
+        projects={projects}
+        sessions={sessions}
+        statusOf={statusOf}
+        agentsStatus={agentsStatus}
+        selectedSessionId={selectedSessionId}
+        onSelectSession={(clickedId) => {
+          const clicked = sessions.find((s) => s.id === clickedId)
+          const remembered = clicked && window.localStorage.getItem(`x:code-workspace-session:${codeWorkspaceKey(clicked)}`)
+          const id = clicked && sessions.some((s) => s.id === remembered && codeWorkspaceKey(s) === codeWorkspaceKey(clicked)) ? remembered! : clickedId
+          setSelectedSessionId(id)
+          // Re-clicking the already-selected session is a no-op for React
+          // state, but the user means "show me this session's chat" — the
+          // chat may have been rebound to another conversation meanwhile.
+          // Re-notify so App re-asserts the binding (it dedupes).
+          if (id === selectedSessionId) {
+            const session = sessions.find((s) => s.id === id)
+            if (session) onSessionSelected?.({ session, status: statusOf(session.id) })
+          }
+        }}
+        onSwitchBranch={(projectId) => setBranchDialog({ projectId, mode: 'switch' })}
+        onAddProject={() => void handleAddProject()}
+        onRemoveProject={(id) => void handleRemoveProject(id)}
+        onNewSession={(projectId, agent) => void handleNewSession(projectId, agent)}
+        onSetDone={(session, done) => void handleSetDone(session, done)}
+        onDeleteSession={setDeleteTarget}
+        onWidthChange={onRailWidthChange}
+        // With a session selected the chat pane sits flush right and draws
+        // the divider (its border-l) — the rail's own would double it.
+        className={selectedSession ? 'border-r-0' : undefined}
       />
 
+      {!selectedSession && (
+        <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 text-center">
+          <FolderOpen className="size-10 text-muted-foreground/40" />
+          <div className="text-sm font-medium">Your projects</div>
+          <p className="max-w-sm px-6 text-xs text-muted-foreground">
+            Open a folder and start a conversation. Enable Harness to work with Claude Code or Codex.
+          </p>
+          {projects.length === 0 ? (
+            <Button size="sm" onClick={() => void handleAddProject()}>Add a project to get started</Button>
+          ) : projects.length === 1 ? (
+            <Button size="sm" onClick={() => void handleNewSession(projects[0].project.id)}>
+              <Plus className="size-3.5" />
+              New thread in {projectLabel(projects[0])}
+            </Button>
+          ) : (
+            <p className="text-xs text-muted-foreground">Pick a session on the left, or start one from a project's + button.</p>
+          )}
+        </div>
+      )}
+
+      {branchDialog && <BranchDialog key={`${branchDialog.projectId}:${branchDialog.mode}`} projectId={branchDialog.projectId} mode={branchDialog.mode}
+        onClose={() => setBranchDialog(null)} onConfirm={async (branch) => {
+          await window.ipc.invoke('codeProject:switchBranch', { projectId: branchDialog.projectId, branch })
+          await refresh()
+        }} />}
       <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete this session?</AlertDialogTitle>
             <AlertDialogDescription>
               The conversation history will be deleted.
-              {deleteTarget?.worktree && !deleteTarget.worktree.removedAt
+              {deleteTarget?.worktree && !deleteTarget.worktree.removedAt && sessions.filter((s) => codeWorkspaceKey(s) === codeWorkspaceKey(deleteTarget)).length === 1
                 ? ' Its worktree and branch will be removed too — merge back first if you want to keep the changes.'
-                : ''}
+                : ' Other sessions and their workspace will be kept.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

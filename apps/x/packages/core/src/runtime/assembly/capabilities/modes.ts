@@ -1,4 +1,5 @@
 import type { CapabilityContext, EagerCapability } from "./types.js";
+import { PRIVACY_RULES, threadProcedure } from "../skills/spaces/procedures.js";
 
 // The app-activated capabilities: the modes the app (not the model) toggles —
 // facts about the world like "the camera is on" whose guidance must be in the
@@ -62,7 +63,24 @@ export const MODE_CAPABILITIES: readonly EagerCapability[] = [
         promptFragment: (ctx: CapabilityContext) =>
             ctx.commandCenter ? COMMAND_CENTER : null,
     },
+    {
+        // A space-thread session (sessions.ts pins it from the session's
+        // origin): the receipt contract and privacy rules, ids filled in.
+        // The spaces tools themselves attach through the pinned activeSkills.
+        id: "space-thread",
+        activation: "app",
+        promptFragment: (ctx: CapabilityContext) =>
+            ctx.spaceThread ? SPACE_THREAD_TEMPLATE(ctx.spaceThread) : null,
+    },
 ];
+
+const SPACE_THREAD_TEMPLATE = (thread: NonNullable<CapabilityContext["spaceThread"]>): string =>
+    `# Space thread session\n\n${threadProcedure({
+        spaceName: thread.spaceName,
+        spaceId: thread.spaceId,
+        threadRootId: thread.threadRootId,
+        org: thread.org,
+    })}\n\n${PRIVACY_RULES}`;
 
 const VOICE_INPUT = `# Voice Input\nThe user's message was transcribed from speech. Be aware that:\n- There may be transcription errors. Silently correct obvious ones (e.g. homophones, misheard words). If an error is genuinely ambiguous, briefly mention your interpretation (e.g. "I'm assuming you meant X").\n- Spoken messages are often long-winded. The user may ramble, repeat themselves, or correct something they said earlier in the same message. Focus on their final intent, not every word verbatim.`;
 
@@ -125,18 +143,32 @@ const CODE_MODE_TEMPLATE = (
     agentDisplay: string,
     codeMode: "claude" | "codex",
     codeCwd: string | null,
-): string => `# Code Mode (Active) — Agent: ${agentDisplay}
-The user has turned on **code mode** and the composer chip is set to **${agentDisplay}** (\`${codeMode}\`). For EVERY coding task this turn, use **${agentDisplay}**, and narrate that agent ("Using ${agentDisplay} to …").
+): string => `# Harness (Active) — Agent: ${agentDisplay}
+The user has turned on **Harness** and the composer chip is set to **${agentDisplay}** (\`${codeMode}\`). For EVERY task and question this turn — including writing, research, planning, document work, questions, and coding — use **${agentDisplay}**, and narrate that agent ("Using ${agentDisplay} to …").
 
-The chip is the single source of truth for which agent runs:
+Harness works for non-coding tasks and in non-git directories too. Do not require a Git repository or switch directories just because Harness is enabled.
+
+That selection is the single source of truth for which agent runs:
 - Do NOT carry over a different agent from earlier in this thread — even if a previous run used the other agent, use **${agentDisplay}** now.
-- Do NOT switch agents based on an in-chat text request ("use codex", "switch to claude"). The agent only changes when the user toggles the chip; if they ask in chat, tell them to toggle the chip.
+- A message that names **${agentDisplay}** ("use ${codeMode}", "have ${agentDisplay} do it") is NOT a switch request — it names the agent already selected. Just do the work with it.
+- Only a request for the OTHER agent is a switch request, and you cannot switch from chat: do the work with **${agentDisplay}**, and mention that the agent is changed ${codeCwd ? "from the Harness agent setting beside the chat input" : "with the composer chip"}.
 
-**How to run coding work — call the \`code_agent_run\` tool** with:
+**How to run the requested work — call the \`code_agent_run\` tool DIRECTLY, as your FIRST action.** Do NOT call \`loadSkill('code-with-agents')\` first — this section already contains everything that skill would tell you, and the extra hop only adds latency. Arguments:
 - \`agent\`: \`${codeMode}\` (always — match the chip).
 - \`cwd\`: ${codeCwd ? `\`${codeCwd}\` (always — this coding session is pinned to that directory; never use another path)` : `the absolute project/working directory when the user named one (or the "# User Work Directory" block); otherwise OMIT it — the run lands in the user's default code repo. Never ask "which folder?"`}.
-- \`prompt\`: a clear, self-contained coding instruction.
+- \`prompt\`: the user's request, forwarded almost verbatim (see below).
+
+**Writing \`prompt\` — forward, don't rewrite.** Pass the user's request through nearly verbatim:
+- Fix only speech-to-text / transcription artifacts, obvious typos, and minor grammar; light formatting (e.g. breaking a run-on spoken sentence into lines) is fine.
+- Do NOT expand, rephrase, or reinterpret the request, and do NOT add speculative implementation details, file guesses, or constraints the user never stated — the coding agent explores the repo itself and is better placed to interpret the request in context.
+- ONE exception: when the user explicitly asks you to gather outside context first ("fetch the error from my email and send it to Claude Code", "pull the spec from my knowledge base for Codex"), collect that context, then send their verbatim request followed by the gathered material under a clearly labeled section (e.g. "Context the user asked me to include:").
 
 The tool runs the agent on-device and streams its tool calls, file diffs, and plan into the chat; any action needing approval surfaces as an inline permission card, so you do NOT pre-confirm with an in-chat "reply yes". This chat keeps ONE persistent agent session, so follow-up coding requests automatically resume with full context — just call \`code_agent_run\` again. Do NOT shell out to \`acpx\` or \`executeCommand\` for coding, and do NOT fall back to your own file tools.
 
-If the user's message is clearly NOT a coding request (small talk, an unrelated question), answer directly without invoking the coding agent. Code mode signals readiness, not that every message must route through the agent.`;
+**After the run — reply in ~2 lines, nothing more.** ${agentDisplay}'s ENTIRE output — every message, plan step, tool call, and file diff — is directly visible to the user, fully formatted, in the run card right above your reply. The user reads the results THERE; your reply is only a hand-off note. On success it is exactly:
+1. One line stating what was done — "I used ${agentDisplay} to implement [task]."
+2. At most one more line with a key outcome the user needs, when applicable — a PR link (if the run created one), or the changes' status / next step (e.g. "The changes are uncommitted on the session branch — say the word to commit.").
+
+STRICTLY FORBIDDEN in that reply: re-summarizing or reiterating what ${agentDisplay} said, listing the files it touched, explaining implementation details, or repeating diffs — the user can already read all of that in the card, and repeating it is pure noise. Only when the run did NOT succeed do you say more: surface a tool error's message (if it mentions the agent isn't installed or signed in, point the user at Settings → Code Mode), or on \`stopReason: "cancelled"\` acknowledge the stop briefly and ask whether to continue.
+
+**Route EVERYTHING through ${agentDisplay} — questions included, not just code changes.** Design questions, product questions, architecture and infra questions, "how does X work?", "should we do A or B?", "explain this code" — these ALL go to ${agentDisplay} via \`code_agent_run\`: it has the repo in front of it and answers from the actual code, so do NOT answer them yourself even when you think you know. The ONLY reason to skip the agent is that the user EXPLICITLY asks YOU to do it yourself ("don't use ${agentDisplay}", "you answer this", "what do YOU think?") — then answer directly and say you're answering without the agent. Pure small talk with no connection to any project (a greeting, "thanks") needs no agent either; everything else routes through ${agentDisplay}.`;

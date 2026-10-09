@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Calendar, ChevronDown, ChevronRight, Clock, ExternalLink, FileText, Loader2, MapPin, Mic, Sparkles, Square, UserPlus, UserRound, UsersRound, Video, X } from 'lucide-react'
-import { Streamdown } from 'streamdown'
+import { Streamdown } from '@/components/streamdown'
 
 import { Button } from '@/components/ui/button'
+import { MeetingEventContextMenu, MeetingNoteContextMenu } from '@/components/meeting-context-menu'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { formatRelativeTime } from '@/lib/relative-time'
@@ -542,7 +543,7 @@ function InlineMeetingPrep({ event, onOpenNote }: { event: UpcomingEvent; onOpen
       ) : null}
       <div className="flex items-center gap-1.5 px-5 pb-1 pt-2.5">
         <UsersRound className="size-3.5 text-muted-foreground" />
-        <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">People</span>
+        <span className="text-[13px] text-muted-foreground">People</span>
       </div>
       {matched.map((att, idx) => (
         <PrepAttendeeNote key={att.note!.path + idx} attendee={att} onOpenNote={onOpenNote} />
@@ -551,7 +552,7 @@ function InlineMeetingPrep({ event, onOpenNote }: { event: UpcomingEvent; onOpen
       {prep.organizations.length > 0 ? (
         <>
           <div className="px-5 pb-1 pt-2.5">
-            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+            <span className="text-[13px] text-muted-foreground">
               {prep.organizations.length === 1 ? 'Company' : 'Companies'}
             </span>
           </div>
@@ -564,7 +565,7 @@ function InlineMeetingPrep({ event, onOpenNote }: { event: UpcomingEvent; onOpen
   )
 }
 
-function UpcomingEvents({ onOpenNote }: { onOpenNote: (path: string) => void }) {
+function UpcomingEvents({ onOpenNote, captureDisabled }: { onOpenNote: (path: string) => void; captureDisabled: boolean }) {
   const [events, setEvents] = useState<UpcomingEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -720,7 +721,7 @@ function UpcomingEvents({ onOpenNote }: { onOpenNote: (path: string) => void }) 
             Coming up
           </h3>
           {loading && events.length === 0 ? null : (
-            <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
+            <span className="text-[13px] text-muted-foreground">
               {totalVisible} {totalVisible === 1 ? 'event' : 'events'}
             </span>
           )}
@@ -754,6 +755,7 @@ function UpcomingEvents({ onOpenNote }: { onOpenNote: (path: string) => void }) 
                 isToday={day.dateKey === todayKey}
                 prepEventId={prepEventId}
                 onOpenNote={onOpenNote}
+                captureDisabled={captureDisabled}
               />
             ))}
           </div>
@@ -764,7 +766,7 @@ function UpcomingEvents({ onOpenNote }: { onOpenNote: (path: string) => void }) 
   )
 }
 
-function UpcomingDayCard({ day, isToday, prepEventId, onOpenNote }: { day: DayGroup; isToday: boolean; prepEventId: string | null; onOpenNote: (path: string) => void }) {
+function UpcomingDayCard({ day, isToday, prepEventId, onOpenNote, captureDisabled }: { day: DayGroup; isToday: boolean; prepEventId: string | null; onOpenNote: (path: string) => void; captureDisabled: boolean }) {
   const dayNum = day.date.getDate()
   const month = day.date.toLocaleDateString([], { month: 'short' })
   const weekday = day.date.toLocaleDateString([], { weekday: 'short' })
@@ -779,7 +781,7 @@ function UpcomingDayCard({ day, isToday, prepEventId, onOpenNote }: { day: DayGr
             {month} · {weekday}
           </span>
           {isToday ? (
-            <span className="shrink-0 rounded-md bg-foreground px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-background">
+            <span className="shrink-0 rounded-md bg-foreground px-1.5 py-0.5 text-[10px] font-semibold text-background">
               Today
             </span>
           ) : null}
@@ -801,6 +803,7 @@ function UpcomingDayCard({ day, isToday, prepEventId, onOpenNote }: { day: DayGr
             isLast={idx === count - 1}
             isPrepTarget={ev.id === prepEventId}
             onOpenNote={onOpenNote}
+            captureDisabled={captureDisabled}
           />
         ))
       )}
@@ -810,13 +813,13 @@ function UpcomingDayCard({ day, isToday, prepEventId, onOpenNote }: { day: DayGr
 
 function NowBadge() {
   return (
-    <span className="shrink-0 rounded bg-green-600 px-1.5 py-px text-[10px] font-bold uppercase leading-[1.5] tracking-wide text-white">
+    <span className="shrink-0 rounded bg-[var(--rowboat-success)] px-1.5 py-px text-[10px] font-bold leading-[1.5] text-white">
       Now
     </span>
   )
 }
 
-function UpcomingEventItem({ event, isLast, isPrepTarget, onOpenNote }: { event: UpcomingEvent; isLast: boolean; isPrepTarget: boolean; onOpenNote: (path: string) => void }) {
+function UpcomingEventItem({ event, isLast, isPrepTarget, onOpenNote, captureDisabled }: { event: UpcomingEvent; isLast: boolean; isPrepTarget: boolean; onOpenNote: (path: string) => void; captureDisabled: boolean }) {
   const [open, setOpen] = useState(false)
   // The next meeting auto-expands its prep; any other meeting with attendees
   // can be expanded on demand via the Prep toggle (resolves lazily on open).
@@ -831,71 +834,78 @@ function UpcomingEventItem({ event, isLast, isPrepTarget, onOpenNote }: { event:
   return (
     <div className={cn(!isLast && 'border-b')}>
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <div
-          role="button"
-          tabIndex={0}
-          title={titleAndLocation}
-          className={cn(
-            'group flex w-full cursor-pointer items-center gap-4 px-5 py-3 text-left transition-colors',
-            showPrep && 'border-b',
-            isNow ? 'bg-muted' : 'hover:bg-muted/50',
-          )}
-        >
-          <span className="shrink-0 text-[13px] tabular-nums text-muted-foreground" style={{ width: 118 }}>
-            {formatEventTimeRangeCompact(event)}
-          </span>
-          <span className="flex min-w-0 flex-1 flex-col">
-            <span className="flex items-center gap-2">
-              <span className="truncate text-sm font-semibold text-foreground">
-                {event.summary}
-              </span>
-              {isNow ? <NowBadge /> : null}
-            </span>
-            {subtitle ? (
-              <span className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
-                {platform ? <Video className="size-3.5 shrink-0" /> : <MapPin className="size-3.5 shrink-0" />}
-                <span className="truncate">{subtitle}</span>
-              </span>
-            ) : null}
-          </span>
-          <div className="flex shrink-0 items-center gap-2">
-            {prepEligible ? (
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); setPrepOpen((v) => !v) }}
-                onMouseDown={(e) => e.stopPropagation()}
-                aria-expanded={prepOpen}
-                title={prepOpen ? 'Hide prep' : 'Show meeting prep'}
-                className={cn(
-                  'inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors',
-                  prepOpen ? 'bg-accent text-foreground' : 'bg-background text-foreground hover:bg-accent',
-                )}
-              >
-                <Sparkles className="size-3.5" />
-                Prep
-                <ChevronDown className={cn('size-3 transition-transform', prepOpen && 'rotate-180')} />
-              </button>
-            ) : null}
-            {event.conferenceLink ? (
-              <SplitJoinButton
-                onJoinAndNotes={() => triggerMeetingCapture(event, true)}
-                onNotesOnly={() => triggerMeetingCapture(event, false)}
-              />
-            ) : (
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); triggerMeetingCapture(event, false) }}
-                onMouseDown={(e) => e.stopPropagation()}
-                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-accent"
-              >
-                <Mic className="size-3.5" />
-                Take notes
-              </button>
+      <MeetingEventContextMenu
+        conferenceLink={event.conferenceLink}
+        calendarLink={event.htmlLink}
+        captureDisabled={captureDisabled}
+        onCapture={(openConference) => triggerMeetingCapture(event, openConference)}
+      >
+        <PopoverTrigger asChild>
+          <div
+            role="button"
+            tabIndex={0}
+            title={titleAndLocation}
+            className={cn(
+              'group flex w-full cursor-pointer items-center gap-4 px-5 py-3 text-left transition-colors',
+              showPrep && 'border-b',
+              isNow ? 'bg-muted' : 'hover:bg-muted/50',
             )}
+          >
+            <span className="shrink-0 text-[13px] tabular-nums text-muted-foreground" style={{ width: 118 }}>
+              {formatEventTimeRangeCompact(event)}
+            </span>
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="flex items-center gap-2">
+                <span className="truncate text-sm font-semibold text-foreground">
+                  {event.summary}
+                </span>
+                {isNow ? <NowBadge /> : null}
+              </span>
+              {subtitle ? (
+                <span className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                  {platform ? <Video className="size-3.5 shrink-0" /> : <MapPin className="size-3.5 shrink-0" />}
+                  <span className="truncate">{subtitle}</span>
+                </span>
+              ) : null}
+            </span>
+            <div className="flex shrink-0 items-center gap-2">
+              {prepEligible ? (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setPrepOpen((v) => !v) }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  aria-expanded={prepOpen}
+                  title={prepOpen ? 'Hide prep' : 'Show meeting prep'}
+                  className={cn(
+                    'inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors',
+                    prepOpen ? 'bg-accent text-foreground' : 'bg-background text-foreground hover:bg-accent',
+                  )}
+                >
+                  <Sparkles className="size-3.5" />
+                  Prep
+                  <ChevronDown className={cn('size-3 transition-transform', prepOpen && 'rotate-180')} />
+                </button>
+              ) : null}
+              {event.conferenceLink ? (
+                <SplitJoinButton
+                  onJoinAndNotes={() => triggerMeetingCapture(event, true)}
+                  onNotesOnly={() => triggerMeetingCapture(event, false)}
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); triggerMeetingCapture(event, false) }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-accent"
+                >
+                  <Mic className="size-3.5" />
+                  Take notes
+                </button>
+              )}
+            </div>
           </div>
-        </div>
-      </PopoverTrigger>
+        </PopoverTrigger>
+      </MeetingEventContextMenu>
       <EventDetailsPopover event={event} onClose={() => setOpen(false)} />
     </Popover>
     {showPrep ? <InlineMeetingPrep event={event} onOpenNote={onOpenNote} /> : null}
@@ -1096,13 +1106,13 @@ function SplitJoinButton({ onJoinAndNotes, onNotesOnly }: {
             <div
               ref={menuRef}
               style={{ position: 'fixed', top: menuPos.top, right: menuPos.right, zIndex: 60 }}
-              className="min-w-36 overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-lg"
+              className="min-w-36 overflow-hidden rounded-2xl border-none bg-popover p-2 text-popover-foreground shadow-[var(--rowboat-shadow)]"
             >
               <button
                 type="button"
                 onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => { e.stopPropagation(); setOpen(false); onNotesOnly() }}
-                className="flex w-full items-center gap-1.5 whitespace-nowrap px-2.5 py-1.5 text-xs transition-colors hover:bg-accent"
+                className="flex w-full items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs transition-colors hover:bg-accent"
               >
                 <Mic className="size-3" />
                 Take notes only
@@ -1271,7 +1281,7 @@ export function MeetingsView({ onOpenNote, onTakeMeetingNotes, meetingState, mee
       </div>
       <div className="flex-1 overflow-auto">
         <div className="mx-auto w-full max-w-[1120px] px-[30px] pb-12">
-        <UpcomingEvents onOpenNote={onOpenNote} />
+        <UpcomingEvents onOpenNote={onOpenNote} captureDisabled={isBusy || isRecording} />
         <div className="pt-6">
         {loading ? (
           <div className="flex items-center justify-center py-10">
@@ -1300,28 +1310,30 @@ export function MeetingsView({ onOpenNote, onTakeMeetingNotes, meetingState, mee
               </colgroup>
               <thead>
                 <tr className="border-b border-border/60 bg-muted/30 text-left">
-                  <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Note</th>
-                  <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Date</th>
-                  <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">Updated</th>
+                  <th className="px-4 py-3 text-[13px] text-muted-foreground">Note</th>
+                  <th className="px-4 py-3 text-[13px] text-muted-foreground">Date</th>
+                  <th className="px-4 py-3 text-[13px] text-muted-foreground">Updated</th>
                 </tr>
               </thead>
               <tbody>
                 {notes.map((note) => (
-                  <tr key={note.path} className="border-b border-border/50 last:border-b-0 hover:bg-muted/20">
-                    <td className="px-4 py-3 align-top">
-                      <button
-                        type="button"
-                        onClick={() => { analytics.meetingNoteOpened(); onOpenNote(note.path) }}
-                        className="block w-full min-w-0 text-left text-sm font-medium text-foreground hover:underline"
-                      >
-                        <span className="block truncate">{note.name}</span>
-                      </button>
-                    </td>
-                    <td className="px-4 py-3 align-top text-sm text-muted-foreground">{note.dateLabel}</td>
-                    <td className="px-4 py-3 align-top text-sm text-muted-foreground">
-                      {note.mtimeMs > 0 ? (formatRelativeTime(new Date(note.mtimeMs).toISOString()) || '—') : '—'}
-                    </td>
-                  </tr>
+                  <MeetingNoteContextMenu key={note.path} path={note.path} onOpen={() => { analytics.meetingNoteOpened(); onOpenNote(note.path) }}>
+                    <tr className="border-b border-border/50 last:border-b-0 hover:bg-muted/20">
+                      <td className="px-4 py-3 align-top">
+                        <button
+                          type="button"
+                          onClick={() => { analytics.meetingNoteOpened(); onOpenNote(note.path) }}
+                          className="block w-full min-w-0 text-left text-sm font-medium text-foreground hover:underline"
+                        >
+                          <span className="block truncate">{note.name}</span>
+                        </button>
+                      </td>
+                      <td className="px-4 py-3 align-top text-sm text-muted-foreground">{note.dateLabel}</td>
+                      <td className="px-4 py-3 align-top text-sm text-muted-foreground">
+                        {note.mtimeMs > 0 ? (formatRelativeTime(new Date(note.mtimeMs).toISOString()) || '—') : '—'}
+                      </td>
+                    </tr>
+                  </MeetingNoteContextMenu>
                 ))}
               </tbody>
             </table>

@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { cn } from '@/lib/utils'
+import { MessageContextMenu } from '@/components/message-context-menu'
 import {
   Message,
   MessageContent,
@@ -23,6 +24,7 @@ import { TokenUsageMenu } from '@/components/token-usage-menu'
 import { matchBillingError } from '@/lib/billing-error'
 import { wikiLabel } from '@/lib/wiki-links'
 import { streamdownComponents, userMessageRemarkPlugins } from '@/lib/markdown-render'
+import { useSmoothedText } from '@/hooks/useSmoothedText'
 import type { PermissionDecision } from '@x/shared/src/code-mode.js'
 import {
   type ChatTabViewState,
@@ -61,6 +63,21 @@ import {
  * pass just `items` and get self-contained collapsible tool rows.
  */
 
+function AssistantMessageBody({ text, streaming }: { text: string; streaming: boolean }) {
+  // ONE MessageResponse (Streamdown) instance renders both phases of an
+  // assistant message: the live stream (smoothed reveal) and its durable
+  // replacement, which shares the item id. Keeping the same element across
+  // the flip preserves Streamdown's per-block highlight memoization and any
+  // mermaid/chart output — a conditional component swap here would remount
+  // the subtree and bring back the end-of-generation flash.
+  const smoothed = useSmoothedText(streaming ? text : '')
+  return (
+    <MessageResponse components={streamdownComponents}>
+      {streaming ? smoothed : text}
+    </MessageResponse>
+  )
+}
+
 function AutoScrollPre({ className, children }: { className?: string; children: React.ReactNode }) {
   const ref = React.useRef<HTMLPreElement>(null)
   const stickToBottom = React.useRef(true)
@@ -95,8 +112,10 @@ export interface TurnConversationProps {
   /**
    * Tool-row open state. Chat panes lift this to the tab store so it survives
    * tab switches; omit both for local per-mount state (transcript surfaces).
+   * Return `undefined` for "no explicit user choice" — the renderer then
+   * applies the per-tool default (coding runs open, everything else closed).
    */
-  isToolOpen?: (toolId: string) => boolean
+  isToolOpen?: (toolId: string) => boolean | undefined
   onToolOpenChange?: (toolId: string, open: boolean) => void
   /** Live-chat permission state (from ChatTabViewState); omitted on read-only surfaces. */
   permissionRequests?: ChatTabViewState['allPermissionRequests']
@@ -126,16 +145,20 @@ export function TurnConversation({
   onComposioConnected,
   className,
 }: TurnConversationProps) {
-  // Local fallback open state for surfaces that don't lift it.
-  const [localOpenTools, setLocalOpenTools] = React.useState<ReadonlySet<string>>(() => new Set())
-  const isToolOpen = isToolOpenProp ?? ((toolId: string) => localOpenTools.has(toolId))
+  // Local fallback open state for surfaces that don't lift it. A Map (not a
+  // Set) so "never toggled" stays distinct from an explicit collapse — the
+  // per-tool default below only applies while there's no explicit choice.
+  const [localOpenTools, setLocalOpenTools] = React.useState<ReadonlyMap<string, boolean>>(() => new Map())
+  const isToolOpenExplicit = isToolOpenProp ?? ((toolId: string) => localOpenTools.get(toolId))
+  // Explicit user choice wins; otherwise coding-run cards default open (the
+  // run card is the primary output surface) and everything else stays closed.
+  const isToolOpen = (toolId: string, defaultOpen = false) => isToolOpenExplicit(toolId) ?? defaultOpen
   const onToolOpenChange =
     onToolOpenChangeProp ??
     ((toolId: string, open: boolean) => {
       setLocalOpenTools((prev) => {
-        const next = new Set(prev)
-        if (open) next.add(toolId)
-        else next.delete(toolId)
+        const next = new Map(prev)
+        next.set(toolId, open)
         return next
       })
     })
@@ -154,14 +177,16 @@ export function TurnConversation({
               </MessageContent>
               {item.content && (
                 <div className="flex flex-col items-end">
-                  <MessageContent>
-                    <MessageResponse
-                      components={streamdownComponents}
-                      remarkPlugins={userMessageRemarkPlugins}
-                    >
-                      {item.content}
-                    </MessageResponse>
-                  </MessageContent>
+                  <MessageContextMenu text={item.content}>
+                    <MessageContent>
+                      <MessageResponse
+                        components={streamdownComponents}
+                        remarkPlugins={userMessageRemarkPlugins}
+                      >
+                        {item.content}
+                      </MessageResponse>
+                    </MessageContent>
+                  </MessageContextMenu>
                   <MessageCopyButton text={item.content} className="mt-0.5" />
                 </div>
               )}
@@ -172,26 +197,28 @@ export function TurnConversation({
         return (
           <Message key={item.id} from={item.role} data-message-id={item.id}>
             <div className="flex flex-col items-end">
-              <MessageContent>
-                {files.length > 0 && (
-                  <div className="mb-2 flex flex-wrap gap-1.5">
-                    {files.map((filePath, index) => (
-                      <span
-                        key={index}
-                        className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary"
-                      >
-                        @{wikiLabel(filePath)}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                <MessageResponse
-                  components={streamdownComponents}
-                  remarkPlugins={userMessageRemarkPlugins}
-                >
-                  {message}
-                </MessageResponse>
-              </MessageContent>
+              <MessageContextMenu text={message}>
+                <MessageContent>
+                  {files.length > 0 && (
+                    <div className="mb-2 flex flex-wrap gap-1.5">
+                      {files.map((filePath, index) => (
+                        <span
+                          key={index}
+                          className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary"
+                        >
+                          @{wikiLabel(filePath)}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <MessageResponse
+                    components={streamdownComponents}
+                    remarkPlugins={userMessageRemarkPlugins}
+                  >
+                    {message}
+                  </MessageResponse>
+                </MessageContent>
+              </MessageContextMenu>
               <MessageCopyButton text={message} className="mt-0.5" />
             </div>
           </Message>
@@ -199,17 +226,26 @@ export function TurnConversation({
       }
       return (
         <Message key={item.id} from={item.role} data-message-id={item.id}>
-          <MessageContent>
-            <MessageResponse components={streamdownComponents}>{item.content}</MessageResponse>
-          </MessageContent>
+          <MessageContextMenu text={item.content}>
+            <MessageContent>
+              <AssistantMessageBody text={item.content} streaming={item.streaming === true} />
+            </MessageContent>
+          </MessageContextMenu>
         </Message>
       )
     }
 
     if (isReasoningMessage(item)) {
-      // Settled thoughts start collapsed; the live streaming row in
-      // ChatSessionPane is what shows reasoning expanded while it happens.
-      return <ReasoningRow key={item.id} content={item.content} />
+      // The live thought stream renders here too (streaming flag → shimmer,
+      // auto-expand); when the call completes, the durable item keeps the
+      // same id and ReasoningRow's own falling-edge handling collapses it.
+      return (
+        <ReasoningRow
+          key={item.id}
+          content={item.content}
+          isStreaming={item.streaming === true}
+        />
+      )
     }
 
     if (isToolCall(item)) {
@@ -218,7 +254,7 @@ export function TurnConversation({
           <CodingRunBlock
             key={item.id}
             item={item}
-            open={isToolOpen(item.id)}
+            open={isToolOpen(item.id, true)}
             onOpenChange={(open) => onToolOpenChange(item.id, open)}
             onPermissionDecision={(decision) => {
               if (item.pendingCodePermission) {

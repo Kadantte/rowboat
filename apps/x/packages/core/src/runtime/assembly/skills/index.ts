@@ -9,8 +9,11 @@ import {
   isCodeModeAvailable,
   isComposioAvailable,
   isSlackAvailable,
+  isSpacesAvailable,
 } from "../connections.js";
 import { loadDiskSkills } from "./disk-loader.js";
+import { SPACES_TOOL_NAMES } from "../../tools/domains/spaces.js";
+import { WHITEBOARD_TOOL_NAMES } from "../../tools/domains/whiteboard.js";
 import builtinToolsSkill from "./builtin-tools/skill.js";
 import deletionGuardrailsSkill from "./deletion-guardrails/skill.js";
 import docCollabSkill from "./doc-collab/skill.js";
@@ -19,6 +22,7 @@ import mcpIntegrationSkill from "./mcp-integration/skill.js";
 import meetingPrepSkill from "./meeting-prep/skill.js";
 import organizeFilesSkill from "./organize-files/skill.js";
 import createPresentationsSkill from "./create-presentations/skill.js";
+import pdfSlidesSkill from "./pdf-slides/skill.js";
 
 import appNavigationSkill from "./app-navigation/skill.js";
 import browserControlSkill from "./browser-control/skill.js";
@@ -29,6 +33,8 @@ import backgroundTaskSkill from "./background-task/skill.js";
 import notifyUserSkill from "./notify-user/skill.js";
 import appsSkill from "./apps/skill.js";
 import slackSkill from "./slack/skill.js";
+import spacesSkill from "./spaces/skill.js";
+import whiteboardSkill from "./whiteboard/skill.js";
 import chartsSkill from "./charts/skill.js";
 import voiceSkill from "./voice/skill.js";
 
@@ -55,8 +61,23 @@ const definitions: SkillDefinition[] = [
   {
     id: "create-presentations",
     title: "Create Presentations",
-    summary: "Create PDF presentations and slide decks from natural language requests using knowledge base context.",
+    summary: "Build and edit real PowerPoint (.pptx) decks — presentations, slide decks, pitch decks, slides. Load for ANY presentation request, including adding/changing one slide or restyling a deck. Decks are never rendered as PDF or HTML and never hand-written via code.",
     content: createPresentationsSkill,
+    tools: [
+      "deck-create",
+      "deck-review",
+      "deck-add-slide",
+      "deck-edit-slide",
+      "deck-restructure",
+      "deck-restyle",
+      "file-mkdir",
+    ],
+  },
+  {
+    id: "pdf-slides",
+    title: "PDF Slides (explicit PDF requests only)",
+    summary: "Render flat HTML→PDF slides. ONLY when the user explicitly asks for a PDF or a printable handout. For any normal presentation / slide deck / pitch deck request use create-presentations instead, which produces an editable .pptx.",
+    content: pdfSlidesSkill,
     tools: ["file-writeText", "file-mkdir"],
   },
   {
@@ -115,6 +136,22 @@ const definitions: SkillDefinition[] = [
     summary: "Discovering, executing, and integrating MCP tools. Use this to check what external capabilities are available and execute MCP tools on behalf of users.",
     content: mcpIntegrationSkill,
     tools: ["addMcpServer", "listMcpServers", "listMcpTools", "executeMcpTool"],
+  },
+  {
+    id: "spaces",
+    availability: isSpacesAvailable,
+    title: "Spaces (team chat, DMs, shared files)",
+    summary: "Your person's team workspace — like Slack: spaces (channels), DMs, threads, discussions, shared files, members. Use for ANY ask about a space, a DM, a teammate's message, 'message/DM <person>', 'what did the team say about', 'post/reply in <space>', 'push/add/update ... to <space>' (e.g. 'push my standup to Roadboard'), 'team roadmap', 'shared doc'. Attaches the full spaces toolset. Writes are visible to the whole team, attributed to your person.",
+    content: spacesSkill,
+    tools: [...SPACES_TOOL_NAMES],
+  },
+  {
+    id: "whiteboard",
+    availability: isSpacesAvailable,
+    title: "Whiteboards (shared drawing boards in Spaces)",
+    summary: "Draw on, read, or change a shared whiteboard — the board in a space: 'draw the flow on the board', 'sketch/diagram X on the whiteboard', 'add a box for Y', 'what's on the board', 'connect A to B', 'clean up the board'. Attaches whiteboard-read and whiteboard-draw (operations, never raw JSON) plus list_spaces to find the space. Drawing is visible to the whole team live.",
+    content: whiteboardSkill,
+    tools: [...WHITEBOARD_TOOL_NAMES, "list_spaces"],
   },
   {
     id: "composio-integration",

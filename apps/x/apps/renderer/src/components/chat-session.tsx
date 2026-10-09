@@ -13,7 +13,7 @@ import {
 } from '@/components/ai-elements/message'
 import {
   type PromptInputMessage,
-  type FileMention,
+  type Mention,
 } from '@/components/ai-elements/prompt-input'
 import { AskHumanRequest } from '@/components/ai-elements/ask-human-request'
 import { ReasoningRow } from '@/components/reasoning-row'
@@ -29,9 +29,12 @@ import { ChatInputWithMentions, type CallPreset, type PermissionMode, type Stage
 import { type ChatTab } from './tab-bar'
 import { useReportTabMeta } from '@/lib/tab-meta'
 import { useSessionTitle } from '@/lib/session-title'
+import { consumeChatJump, usePendingChatJump } from '@/lib/chat-jump'
 import {
   type ChatTabViewState,
   type ChatViewportAnchorState,
+  isChatMessage,
+  isReasoningMessage,
 } from '@/lib/chat-conversation'
 
 function SmoothStreamingMessage({ text, components }: { text: string; components: typeof streamdownComponents }) {
@@ -57,7 +60,8 @@ export interface ChatSessionPaneProps {
   tabState: ChatTabViewState
   viewportAnchor: ChatViewportAnchorState | undefined
   onPickPrompt: (prompt: string) => void
-  isToolOpenForTab: (tabId: string, toolId: string) => boolean
+  /** `undefined` = no explicit choice; TurnConversation applies the per-tool default. */
+  isToolOpenForTab: (tabId: string, toolId: string) => boolean | undefined
   setToolOpenForTab: (tabId: string, toolId: string, open: boolean) => void
   /** Optional: without it, pending permission requests render no approve/deny card (side-pane chat may omit the handler). */
   onPermissionResponse?: (toolCallId: string, subflow: string[], response: 'approve' | 'deny') => void | Promise<void>
@@ -70,6 +74,13 @@ export interface ChatSessionPaneProps {
   onCodePermissionResponse?: (toolCallId: string, requestId: string, decision: PermissionDecision) => void | Promise<void>
   /** Notified when a ComposioConnectCard finishes connecting a toolkit. */
   onComposioConnected?: (toolkitSlug: string) => void
+  /** Empty-state flavour: 'code' for a chat bound to a coding session. */
+  emptyStateVariant?: 'default' | 'code'
+  /**
+   * Chat bound to a coding session: the transcript follows Codex semantics
+   * (sends jump to the live edge) instead of ChatGPT's send-anchoring.
+   */
+  isCodeSession?: boolean
 }
 
 export function ChatSessionPane({
@@ -87,6 +98,8 @@ export function ChatSessionPane({
   activeIsReasoning,
   onCodePermissionResponse,
   onComposioConnected,
+  emptyStateVariant = 'default',
+  isCodeSession = false,
 }: ChatSessionPaneProps) {
   // Content-owned tab meta (see lib/tab-meta.ts). Both live instances of a
   // chat (full-screen App pane + side-pane chat) report the same values, so
@@ -117,9 +130,31 @@ export function ChatSessionPane({
   const askBatchTotal = askBatchMaxRef.current
   const currentAsk = pendingAsks[0]
 
+  // A deep link into this session (lib/chat-jump.ts): claim it once the pane
+  // is mounted for that session and hand it to the Conversation; the scroll
+  // controller pins the row when the transcript renders it.
+  const pendingJump = usePendingChatJump(tab.runId)
+  const [jump, setJump] = React.useState<{ messageId: string; key: number } | null>(null)
+  React.useEffect(() => {
+    if (!pendingJump || !tab.runId) return
+    const messageId = consumeChatJump(tab.runId)
+    if (messageId) setJump((prev) => ({ messageId, key: (prev?.key ?? 0) + 1 }))
+  }, [pendingJump, tab.runId])
+
   const tabHasConversation = tabState.conversation.length > 0 || tabState.currentAssistantMessage
+  // Store-backed chats stream through synthetic conversation items that carry
+  // their durable ids (turn-view.ts), so completion updates the mounted nodes
+  // in place. The fallback slots below render only when no such item exists:
+  // legacy (non-store) runs, and edge states like a failed turn's unflushed
+  // overlay tail.
+  const hasLiveReasoningItem = tabState.conversation.some(
+    (item) => isReasoningMessage(item) && item.streaming === true
+  )
+  const hasLiveAssistantItem = tabState.conversation.some(
+    (item) => isChatMessage(item) && item.streaming === true
+  )
   const tabConversationContentClassName = cn(
-    'mx-auto w-full max-w-4xl',
+    'mx-auto w-full max-w-[820px] px-6',
     tabHasConversation ? 'pb-28' : 'pb-0',
     !tabHasConversation && 'min-h-full items-center justify-center',
   )
@@ -135,14 +170,19 @@ export function ChatSessionPane({
       aria-hidden={!isActive}
     >
       <Conversation
+        scrollMode={isCodeSession ? 'code' : 'chat'}
+        scrollMemoryKey={tab.chatId}
         anchorMessageId={viewportAnchor?.messageId}
         anchorRequestKey={viewportAnchor?.requestKey}
+        jumpMessageId={jump?.messageId}
+        jumpRequestKey={jump?.key}
         className="relative flex-1"
       >
         <ConversationContent className={tabConversationContentClassName}>
           {!tabHasConversation ? (
             <ChatEmptyState
               wide
+              variant={emptyStateVariant}
               onPickPrompt={onPickPrompt}
             />
           ) : (
@@ -177,18 +217,16 @@ export function ChatSessionPane({
                 />
               )}
 
-              {/* In-flight model call's thought stream: open with a
-                  "Thinking..." shimmer while reasoning streams, auto-collapses
-                  once the model moves on to its answer. Replaced by the
-                  durable (collapsed) reasoning item when the call completes. */}
-              {tabState.currentReasoning && (
+              {/* Legacy fallback: in-flight thought stream for runs whose
+                  transcript doesn't carry the synthetic streaming items. */}
+              {tabState.currentReasoning && !hasLiveReasoningItem && (
                 <ReasoningRow
                   content={tabState.currentReasoning}
                   isStreaming={isActive && activeIsReasoning}
                 />
               )}
 
-              {tabState.currentAssistantMessage && (
+              {tabState.currentAssistantMessage && !hasLiveAssistantItem && (
                 <Message from="assistant">
                   <MessageContent>
                     <SmoothStreamingMessage text={tabState.currentAssistantMessage.replace(/<\/?voice>/g, '')} components={streamdownComponents} />
@@ -219,13 +257,15 @@ export function ChatSessionPane({
 export interface ChatSessionComposerProps {
   tab: ChatTab
   isActive: boolean
+  /** Visible windows can remain interactive without all claiming autofocus/paste. */
+  focused?: boolean
   tabState: ChatTabViewState
   knowledgeFiles: string[]
   recentFiles: string[]
   visibleFiles: string[]
   onSubmit: (
     message: PromptInputMessage,
-    mentions?: FileMention[],
+    mentions?: Mention[],
     stagedAttachments?: StagedAttachment[],
     searchEnabled?: boolean,
     codeMode?: 'claude' | 'codex',
@@ -246,7 +286,7 @@ export interface ChatSessionComposerProps {
   onPullQueued?: (queueId: string) => void
   presetMessage: string | undefined
   onPresetMessageConsumed: () => void
-  codeSessionLocks: Record<string, { cwd: string; agent: 'claude' | 'codex' }>
+  codeSessionLocks: Record<string, { cwd: string; agent: 'claude' | 'codex'; codeModeEnabled?: boolean }>
   initialDraft: string | undefined
   onDraftChange: (tabId: string, text: string) => void
   /**
@@ -291,6 +331,7 @@ export interface ChatSessionComposerProps {
 export function ChatSessionComposer({
   tab,
   isActive,
+  focused = isActive,
   tabState,
   knowledgeFiles,
   recentFiles,
@@ -353,7 +394,7 @@ export function ChatSessionComposer({
               >
                 {queuedMessageText(entry.message) || 'Attachment'}
               </button>
-              <span className="shrink-0 text-[10px] uppercase tracking-wider opacity-60">Queued</span>
+              <span className="shrink-0 text-[13px] text-muted-foreground">Queued</span>
               <button
                 type="button"
                 onClick={() => onRemoveQueued?.(entry.queueId)}
@@ -367,6 +408,7 @@ export function ChatSessionComposer({
         </div>
       )}
       <ChatInputWithMentions
+        draftKey={tab.chatId}
         knowledgeFiles={knowledgeFiles}
         recentFiles={recentFiles}
         visibleFiles={visibleFiles}
@@ -377,7 +419,7 @@ export function ChatSessionComposer({
         // sessions:sendOrQueueMessage (the Stop button still shows while busy).
         allowSubmitWhileProcessing
         isStopping={isActive && isStopping}
-        isActive={isActive}
+        isActive={focused}
         presetMessage={isActive ? presetMessage : undefined}
         onPresetMessageConsumed={isActive ? onPresetMessageConsumed : undefined}
         runId={tabState.runId}

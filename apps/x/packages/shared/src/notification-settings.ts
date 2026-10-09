@@ -10,6 +10,10 @@ import { z } from 'zod';
  * - todo:             a delegated to-do item finished or needs review (Home)
  * - meeting_detection: popup when Rowboat detects you're in a call/meeting
  * - meeting_notes_ready: meeting notes finished generating after a call
+ * - space_mention:    the org told us a message deserves attention (a mention,
+ *                     @here, a DM, a reply in a followed thread — its `notify`
+ *                     frame, decided server-side), or a reminder set in a
+ *                     space fired / a scheduled message failed to send.
  */
 export const NotificationCategorySchema = z.enum([
   'chat_completion',
@@ -19,6 +23,7 @@ export const NotificationCategorySchema = z.enum([
   'todo',
   'meeting_detection',
   'meeting_notes_ready',
+  'space_mention',
 ]);
 
 export const NotificationCategoriesSchema = z.object({
@@ -29,6 +34,7 @@ export const NotificationCategoriesSchema = z.object({
   todo: z.boolean(),
   meeting_detection: z.boolean(),
   meeting_notes_ready: z.boolean(),
+  space_mention: z.boolean(),
 });
 
 export const NotificationSettingsSchema = z.object({
@@ -44,6 +50,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
     todo: true,
     meeting_detection: true,
     meeting_notes_ready: true,
+    space_mention: true,
   },
 };
 

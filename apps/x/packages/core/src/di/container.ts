@@ -1,3 +1,5 @@
+import { projectSessionComposition } from '../code-mode/sessions/composition.js';
+import { markWorkspaceStarted } from '../code-mode/sessions/workspace-started.js';
 import path from "node:path";
 import { asClass, asFunction, asValue, createContainer, InjectionMode } from "awilix";
 import { WorkDir } from "../config/config.js";
@@ -163,14 +165,19 @@ container.register({
     //   that one conversation are operations on Home (to-dos, dispatch,
     //   status), never "just chat".
     // Null for ordinary chats.
+    beforeSessionStart: asFunction(
+        ({ codeSessionsRepo }: { codeSessionsRepo: ICodeSessionsRepo }) => async (sessionId: string) => {
+            const meta = await codeSessionsRepo.get(sessionId);
+            if (meta) await markWorkspaceStarted(meta);
+        },
+    ).singleton(),
     sessionCompositionPins: asFunction(
         ({ codeSessionsRepo }: { codeSessionsRepo: ICodeSessionsRepo }) =>
             async (sessionId: string): Promise<Record<string, JsonValue> | null> => {
                 const pins: Record<string, JsonValue> = {};
                 const meta = await codeSessionsRepo.get(sessionId).catch(() => null);
                 if (meta) {
-                    pins.codeMode = meta.agent;
-                    pins.codeCwd = meta.cwd;
+                    Object.assign(pins, projectSessionComposition(meta));
                 }
                 // Hot path (every turn) — the pointer is memory-cached in
                 // the module, and the import is static so the edge shows in

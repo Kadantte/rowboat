@@ -707,6 +707,11 @@ interface ModelCallFailed extends BaseTurnEvent {
   type: "model_call_failed";
   modelCallIndex: number;
   error: string;
+  // Present when a live call died: ms since model_call_requested, and ms
+  // since the provider's last stream event. A dropped connection shows a
+  // long idle gap; a slow but healthy stream does not.
+  elapsedMs?: number;
+  idleMs?: number;
 }
 ```
 
@@ -715,7 +720,10 @@ content duplicates provider step events.
 
 Any successfully completed assistant response without tool calls completes the
 turn, including responses whose finish reason is `length` or `content-filter`.
-Provider and stream failures fail the turn.
+Provider and stream failures fail the turn. `error` is the provider's message
+plus, when available, the HTTP status, the response body, and the error's
+`cause` chain — a socket failure such as `read ETIMEDOUT` or a body timeout
+surfaces only there, behind a generic `terminated`.
 
 Only the primary model calls directly controlled by the turn loop are recorded
 as model calls. Internal model calls hidden inside the permission classifier or
@@ -729,6 +737,7 @@ interface InputAdded extends BaseTurnEvent {
   type: "input_added";
   inputIndex: number; // 1-based; index 0 is turn_created.input
   message: UserMessage;
+  origin?: InputOrigin; // as turn_created.origin: recorded verbatim, never read
 }
 ```
 
@@ -739,8 +748,13 @@ turn-definition immutability. Rules:
 - The messages come from a caller-supplied drain (`takeInputs`,
   section 15.2) polled once per loop iteration at the boundary: the tool
   batch has settled, completion was ruled out, the budget check and the
-  next `model_call_requested` are about to run. The loop never learns where
-  the messages come from (session queue, test fixture).
+  next `model_call_requested` are about to run. The loop never learns which
+  SOURCE drains (session queue, test fixture). Each message may carry an
+  `origin` — what outside the runtime caused it (`@x/shared` origins.ts, a
+  discriminated union: a space mention today) — written onto its
+  `input_added` verbatim and never acted on, exactly like
+  `turn_created.origin` for the first input. Consumers answer "is the agent
+  working on the thing I did?" from bus events alone.
 - Injection is purely additive. It never interrupts an in-flight model
   stream or tool execution and never cancels pending work; the message
   lands as a plain user message positioned after the batch's tool results.
@@ -1396,7 +1410,11 @@ interface CreateTurnInput {
 // the abort signal — both are ephemeral per-invocation channels into a live
 // advance that become durable only when acted on (turn_cancelled /
 // input_added respectively).
-type TakeAddedInputs = () => UserMessage[] | Promise<UserMessage[]>;
+interface AddedInput {
+  message: UserMessage;
+  origin?: InputOrigin; // lands on input_added.origin
+}
+type TakeAddedInputs = () => AddedInput[] | Promise<AddedInput[]>;
 
 interface ITurnRuntime {
   createTurn(input: CreateTurnInput): Promise<string>;

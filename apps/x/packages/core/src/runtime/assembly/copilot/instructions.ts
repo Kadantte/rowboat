@@ -5,6 +5,7 @@ import {
     isCodeModeAvailable,
     isComposioAvailable,
     isSlackAvailable,
+    isSpacesAvailable,
 } from "../connections.js";
 
 /** Which native email provider is connected, if any. */
@@ -90,7 +91,7 @@ Load the \`composio-integration\` skill when the user asks to interact with any 
 `;
 }
 
-function buildStaticInstructions(composioEnabled: boolean, catalog: string, codeModeEnabled: boolean = true, slackConnected: boolean = false, slackChannelsHint: string = '', emailProvider: EmailProviderName = null): string {
+function buildStaticInstructions(composioEnabled: boolean, catalog: string, codeModeEnabled: boolean = true, slackConnected: boolean = false, slackChannelsHint: string = '', emailProvider: EmailProviderName = null, spacesConnected: boolean = false): string {
     const emailConnected = emailProvider !== null;
     const emailProduct = emailProductName(emailProvider);
 
@@ -143,6 +144,12 @@ function buildStaticInstructions(composioEnabled: boolean, catalog: string, code
         ? `\n**Slack (connected):** For ANY Slack request — reading, catching up, searching, or sending — your FIRST action MUST be \`loadSkill('slack')\`. Slack is connected natively via the agent-slack CLI: NEVER tell the user it isn't connected, and NEVER route Slack through Composio.${slackChannelsLine}\n`
         : '';
 
+    // Spaces (the team's own workspace on a Rowboat org): one nudge, the
+    // skill carries the rest and attaches the whole toolset on load.
+    const spacesBlock = spacesConnected
+        ? `\n**Spaces (the team's workspace, connected):** For ANY ask about a space, a DM, a teammate's message, a space file, "message/DM <person>", "what did the team say about …", "post/reply in <space>", or "push/add … to <space>" — your FIRST action MUST be \`loadSkill('spaces')\`. It attaches the spaces tools; do not answer "I can't reach the team" without loading it.\n`
+        : '';
+
     const slackToolPriority = slackConnected
         ? ` For Slack specifically, load the \`slack\` skill and use the agent-slack CLI — Slack is connected natively, not via Composio.`
         : '';
@@ -188,14 +195,14 @@ Rowboat is an agentic assistant for everyday work - emails, meetings, projects, 
 
 **Email Drafting:** When users ask you to **draft** or **compose** emails (e.g., "draft a follow-up to Monica", "write an email to John about the project"), load the \`draft-emails\` skill first.${emailDraftSuffix}
 
-${thirdPartyBlock}${gmailBlock}${slackBlock}**Meeting Prep:** When users ask you to prepare for a meeting, prep for a call, or brief them on attendees, load the \`meeting-prep\` skill first.
+${thirdPartyBlock}${gmailBlock}${slackBlock}${spacesBlock}**Meeting Prep:** When users ask you to prepare for a meeting, prep for a call, or brief them on attendees, load the \`meeting-prep\` skill first.
 
-**Create Presentations:** When users ask you to create a presentation, slide deck, pitch deck, or PDF slides, load the \`create-presentations\` skill first.
+**Presentations & Slide Decks:** Rowboat builds real, editable PowerPoint decks. When users ask for a **presentation, slide deck, pitch deck, slides, a deck, or a .pptx** — including "add a slide about X", "change slide 3", "restyle my deck" — your FIRST action MUST be \`loadSkill('create-presentations')\`, which attaches the \`deck-*\` tools. Presentations MUST be built with \`deck-create\`: never render one as a PDF or HTML, never hand-write a .pptx via \`executeCommand\`/python-pptx/any script, never fabricate one with \`file-writeText\`, and never hand back a markdown outline instead of the file. Only when the user explicitly asks for a **PDF** or a printable handout should you load \`pdf-slides\` instead.
 
 **Document Collaboration:** For ANY writing into a knowledge-base note — creating, editing, or refining, **even small one-off edits** ("let's work on [X]", "help me write [X]", "create a doc for [X]") — you MUST load the \`doc-collab\` skill first; it carries the canonical writing style for the knowledge base.
 
 ${codeModeEnabled
-    ? `**Code with Agents:** When users ask you to write code, build a project, create a script, fix a bug, or do any software development task — **including simple things like "create a .c file" or "write a hello-world in Python"** — your FIRST action MUST be \`loadSkill('code-with-agents')\`. Do NOT reach for \`executeCommand\` (PowerShell / bash / shell) or any workspace file tool to do code work yourself before loading this skill. The skill decides whether to delegate to Claude Code / Codex (via acpx) or hand control back to you, and it presents the user a one-click choice when needed. Paths outside the Rowboat workspace root (e.g. \`G:/...\`, \`~/projects/...\`) are NORMAL for coding tasks — do NOT raise "outside workspace" concerns or fall back to your own tools.`
+    ? `**Code with Agents:** When users ask you to write code, build a project, create a script, fix a bug, or do any software development task — **including simple things like "create a .c file" or "write a hello-world in Python"**, and including design, product, architecture, and infra QUESTIONS about a project ("how does X work?", "should we do A or B?") — your FIRST action MUST be \`loadSkill('code-with-agents')\`. The coding agent handles questions too, answering from the actual code; do NOT answer them yourself unless the user explicitly asks you to answer without the coding agent. EXCEPTION: if a "# Code Mode (Active)" section is present in your system context, skip the skill and call \`code_agent_run\` directly — that section already carries the full dispatch instructions, and the extra skill load only adds latency. Do NOT reach for \`executeCommand\` (PowerShell / bash / shell) or any workspace file tool to do code work yourself before loading this skill. The skill decides whether to delegate to Claude Code / Codex (via acpx) or hand control back to you, and it presents the user a one-click choice when needed. Paths outside the Rowboat workspace root (e.g. \`G:/...\`, \`~/projects/...\`) are NORMAL for coding tasks — do NOT raise "outside workspace" concerns or fall back to your own tools.`
     : `**Code with Agents (disabled):** Code mode is currently OFF in the user's settings. Do NOT load \`code-with-agents\` and do NOT call acpx. Handle coding requests yourself with your normal tools if you can. After answering, add a final line letting the user know they can delegate coding to Claude Code or Codex by enabling Code Mode in Settings → Code Mode.`}
 
 **App Control (drive the app):** You can drive the Rowboat UI the user is looking at — open any view, READ what a view contains as data, and open specific items (an email thread, a note, an agent, a past chat). When users ask to open, show, find, or ask about anything that lives inside Rowboat, load the \`app-navigation\` skill first. This matters most on calls: navigate so the user sees what you see, then answer briefly.
@@ -249,6 +256,8 @@ When a user asks you to prep them for a call with someone, you already know ever
 
 ## The Knowledge Graph
 The knowledge graph is the user's **Brain**. If the user says "my brain", "the brain", "look into your brain", "check my brain", "Brain", or similar, they mean the knowledge graph stored in \`knowledge/\`. Treat "Brain" and "knowledge graph" as the same thing.
+
+**Projects:** The Projects sidebar organizes local project folders and their assistant chats. Existing project folders live in \`knowledge/Workspace/<project name>\`. A chat started in a project has that folder set as its work directory. Use it for project files and generated outputs, and call these folders "projects" in conversation. Projects are local; Spaces are shared remote collaboration. Do not use Spaces tools to read or save local project files. Honor an explicit different path from the user.
 
 The knowledge graph is stored as plain markdown with Obsidian-style backlinks in \`knowledge/\` (inside the workspace). The folder is organized into these categories:
 - **Notes/** - Default location for user-authored notes. Create new notes here unless the user specifies a different folder.
@@ -346,7 +355,7 @@ ${runtimeContextPrompt}
 - Use absolute paths or \`~/...\` paths when the user refers to Desktop, Downloads, Documents, the injected work directory, or any other location outside the Rowboat workspace.
 - File operations inside the Rowboat workspace normally run without approval. File operations outside the workspace may trigger a permission prompt; this is expected.
 - Do NOT use \`executeCommand\` just to read, write, edit, list, search, move, copy, or remove files. Use file tools and let the permission system handle access.
-- Do NOT read binary files as text. Use \`parseFile\` or \`LLMParse\` for PDFs, Office docs, images, scanned docs, presentations, and other non-text formats.
+- Do NOT read binary files as text. Use \`parseFile\` or \`LLMParse\` for PDFs, Office docs, images, scanned docs, and other non-text formats — EXCEPT .pptx presentations: read those with \`deck-review\` (load \`create-presentations\` first), never with \`parseFile\` or \`LLMParse\`.
 - Do NOT access files outside the workspace unless the user explicitly asks you to or the current task clearly requires it.
 - Load the \`organize-files\` skill for guidance on file organization tasks.
 
@@ -355,7 +364,7 @@ ${runtimeContextPrompt}
 **IMPORTANT**: Rowboat provides builtin tools. Your always-attached base set:
 - \`file-readText\`, \`file-list\`, \`file-exists\`, \`file-glob\`, \`file-grep\`, \`file-getRoot\` - Read-side file operations, directory exploration, and search
 - \`parseFile\` - Parse and extract text from files (PDF, Excel, CSV, Word .docx). Accepts absolute, ~/..., or relative paths — no need to copy files into the workspace first. Best for well-structured digital documents.
-- \`LLMParse\` - Send a file to the configured LLM as a multimodal attachment to extract content as markdown. Use this instead of \`parseFile\` for scanned PDFs, images with text, complex layouts, presentations, or any format where local parsing falls short. Supports documents and images.
+- \`LLMParse\` - Send a file to the configured LLM as a multimodal attachment to extract content as markdown. Use this instead of \`parseFile\` for scanned PDFs, images with text, complex layouts, or any format where local parsing falls short. Supports documents and images. Not for .pptx decks — those go through \`deck-review\`.
 - \`web-search\` - Search the web. Returns rich results with full text, highlights, and metadata. The \`category\` parameter defaults to \`general\` (full web search) — only use a specific category like \`news\`, \`company\`, \`research paper\` etc. when the query is clearly about that type. For everyday queries (weather, restaurants, prices, how-to), use \`general\`.
 - \`fetch-url\` - Fetch a URL's contents
 - \`save-to-memory\` - Save observations about the user to the agent memory system. Use this proactively during conversations.
@@ -425,12 +434,13 @@ export async function buildCopilotInstructions(): Promise<string> {
     if (cachedInstructions !== null) return cachedInstructions;
     // Connection facts come from the shared checks in connections.ts — the
     // same source the skill catalog's availability gating uses.
-    const [composioEnabled, codeModeEnabled, slackConnected, emailProvider] =
+    const [composioEnabled, codeModeEnabled, slackConnected, emailProvider, spacesConnected] =
         await Promise.all([
             isComposioAvailable(),
             isCodeModeAvailable(),
             isSlackAvailable(),
             getActiveEmailProviderId(),
+            isSpacesAvailable(),
         ]);
     let slackChannelsHint = '';
     if (slackConnected) {
@@ -456,7 +466,7 @@ export async function buildCopilotInstructions(): Promise<string> {
     // the live skill set so disk skills added/removed at runtime (after
     // refreshDiskSkills + cache invalidation) are reflected.
     const catalog = await buildAvailableSkillCatalog();
-    const baseInstructions = buildStaticInstructions(composioEnabled, catalog, codeModeEnabled, slackConnected, slackChannelsHint, emailProvider);
+    const baseInstructions = buildStaticInstructions(composioEnabled, catalog, codeModeEnabled, slackConnected, slackChannelsHint, emailProvider, spacesConnected);
     const composioPrompt = await getComposioToolsPrompt(slackConnected, emailProvider);
     const appsPrompt = await getInstalledAppsPrompt();
     cachedInstructions = baseInstructions

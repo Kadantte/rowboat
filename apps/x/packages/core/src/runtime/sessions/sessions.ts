@@ -1,5 +1,6 @@
 import type { z } from "zod";
 import type { UserMessage } from "@x/shared/dist/message.js";
+import type { SessionOrigin } from "@x/shared/dist/origins.js";
 import {
     type QueuedSessionMessage,
     SessionCreated,
@@ -23,6 +24,7 @@ import {
 import type { IMonotonicallyIncreasingIdGenerator } from "../../application/lib/id-gen.js";
 import { chatActivity } from "../../application/lib/chat-activity.js";
 import {
+    type AddedInput,
     type ITurnRuntime,
     type Turn,
     type TurnExecution,
@@ -37,6 +39,7 @@ import { carriesSkillsForward } from "../assembly/traits.js";
 import type { IClock } from "../turns/clock.js";
 import {
     type ISessions,
+    RECLAIMED_TURN_REASON,
     type SendMessageConfig,
     TurnNotSettledError,
 } from "./api.js";
@@ -55,6 +58,8 @@ export interface SessionsDependencies {
     // turn's composition SERVER-side so prompt assembly never depends on
     // which client surface sent the message. Injected by DI; the session
     // layer knows nothing about what the pins mean.
+    // Awaited under the session lock before accepting its first turn.
+    beforeSessionStart?: (sessionId: string) => Promise<void>;
     sessionCompositionPins?: (sessionId: string) => Promise<Record<string, JsonValue> | null>;
 }
 
@@ -66,7 +71,9 @@ interface ActiveAdvance {
 
 // One pending-queue entry (QueuedSessionMessage plus the SendMessageConfig it
 // arrived with — used only if the entry is promoted to a new turn; a steered
-// entry joins the live turn, whose configuration wins).
+// entry joins the live turn, whose configuration wins. The config's origin
+// is the one field that rides along either way: it lands on turn_created at
+// promotion and on input_added at steer).
 interface PendingSessionEntry {
     queueId: string;
     message: z.infer<typeof UserMessage>;
@@ -75,7 +82,14 @@ interface PendingSessionEntry {
 }
 
 function publicQueueEntry(entry: PendingSessionEntry): QueuedSessionMessage {
-    return { queueId: entry.queueId, message: entry.message, ts: entry.ts };
+    return {
+        queueId: entry.queueId,
+        message: entry.message,
+        ts: entry.ts,
+        ...(entry.config.origin === undefined
+            ? {}
+            : { origin: entry.config.origin }),
+    };
 }
 
 // The session layer per session-design.md: owns conversations as ordered
@@ -89,6 +103,7 @@ export class SessionsImpl implements ISessions {
     private readonly idGenerator: IMonotonicallyIncreasingIdGenerator;
     private readonly clock: IClock;
     private readonly sessionBus: ISessionBus;
+    private readonly beforeSessionStart?: (sessionId: string) => Promise<void>;
     private readonly sessionCompositionPins?: (
         sessionId: string,
     ) => Promise<Record<string, JsonValue> | null>;
@@ -113,6 +128,7 @@ export class SessionsImpl implements ISessions {
         clock,
         sessionBus,
         sessionCompositionPins,
+        beforeSessionStart,
     }: SessionsDependencies) {
         this.sessionRepo = sessionRepo;
         this.turnRuntime = turnRuntime;
@@ -120,6 +136,7 @@ export class SessionsImpl implements ISessions {
         this.clock = clock;
         this.sessionBus = sessionBus;
         this.sessionCompositionPins = sessionCompositionPins;
+        this.beforeSessionStart = beforeSessionStart;
     }
 
     // §8.2: scan session files, read each session's latest turn for status.
@@ -157,7 +174,7 @@ export class SessionsImpl implements ISessions {
         return deriveTurnStatus(reduceTurn(turn.events));
     }
 
-    async createSession(input?: { title?: string }): Promise<string> {
+    async createSession(input?: { title?: string; origin?: SessionOrigin }): Promise<string> {
         const sessionId = await this.idGenerator.next();
         const event = SessionCreated.parse({
             type: "session_created",
@@ -165,6 +182,7 @@ export class SessionsImpl implements ISessions {
             sessionId,
             ts: this.clock.now(),
             ...(input?.title === undefined ? {} : { title: input.title }),
+            ...(input?.origin === undefined ? {} : { origin: input.origin }),
         });
         await this.sessionRepo.create(event);
         this.publishEntry(sessionIndexEntry(reduceSession([event]), "none"));
@@ -234,10 +252,30 @@ export class SessionsImpl implements ISessions {
         return this.sessionRepo.withLock(sessionId, async () => {
             const events = await this.sessionRepo.read(sessionId);
             const state = reduceSession(events);
-            const latestTurnState = await this.latestTurnState(state);
-            const status = latestTurnState
+            let latestTurnState = await this.latestTurnState(state);
+            let status = latestTurnState
                 ? deriveTurnStatus(latestTurnState)
                 : "none";
+            // An "idle" turn with no live advance in this process is a turn
+            // NOTHING is running: the process driving it died (or its advance
+            // rejected as infrastructure) before a terminal event was written.
+            // It will never settle, so deliver-ASAP must not park messages
+            // behind it forever — cancel it (the §22 fast-path: no live
+            // dependencies, never re-issues a model call) and deliver this
+            // message as a fresh turn. A suspended turn is different: it is
+            // parked on a permission or async tool and legitimately waits
+            // with no advance, so it still queues.
+            if (
+                status === "idle" &&
+                state.latestTurnId &&
+                !this.active.has(state.latestTurnId)
+            ) {
+                await this.abortOrCancel(state.latestTurnId, RECLAIMED_TURN_REASON);
+                latestTurnState = await this.latestTurnState(state);
+                status = latestTurnState
+                    ? deriveTurnStatus(latestTurnState)
+                    : "none";
+            }
             const settled =
                 status === "none" ||
                 status === "completed" ||
@@ -324,6 +362,7 @@ export class SessionsImpl implements ISessions {
         input: z.infer<typeof UserMessage>,
         config: SendMessageConfig,
     ): Promise<{ turnId: string }> {
+        if (state.turns.length === 0) await this.beforeSessionStart?.(sessionId);
         let agentRequest = latestTurnState
             ? withActiveSkills(config.agent, deriveActiveSkills(latestTurnState))
             : config.agent;
@@ -333,9 +372,15 @@ export class SessionsImpl implements ISessions {
         // messages promoted after settle), the session's pinned composition
         // is the same — the client's copy is at most a cosmetic hint, and
         // the pins win on conflict.
-        if (this.sessionCompositionPins && !isInlineAgentRequest(agentRequest)) {
-            const pins = await this.sessionCompositionPins(sessionId).catch(() => null);
-            if (pins && Object.keys(pins).length > 0) {
+        if (!isInlineAgentRequest(agentRequest)) {
+            const pins: Record<string, JsonValue> = {
+                ...(this.sessionCompositionPins
+                    ? ((await this.sessionCompositionPins(sessionId).catch(() => null)) ?? {})
+                    : {}),
+                ...spaceThreadPins(state.origin),
+                ...spaceMentionPins(input),
+            };
+            if (Object.keys(pins).length > 0) {
                 const provided = agentRequest.overrides?.composition;
                 const base: { [key: string]: JsonValue } =
                     provided !== undefined &&
@@ -344,11 +389,22 @@ export class SessionsImpl implements ISessions {
                     !Array.isArray(provided)
                         ? (provided as { [key: string]: JsonValue })
                         : {};
+                // activeSkills is the one pin that MERGES (a pinned skill
+                // joins whatever the session already loaded) — every other
+                // pin overrides, the session's identity winning on conflict.
+                const merged: { [key: string]: JsonValue } = { ...base, ...pins };
+                if (Array.isArray(pins.activeSkills)) {
+                    const carried = parseActiveSkills(base);
+                    merged.activeSkills = [
+                        ...carried,
+                        ...parseActiveSkills(pins).filter((id) => !carried.includes(id)),
+                    ];
+                }
                 agentRequest = {
                     ...agentRequest,
                     overrides: {
                         ...agentRequest.overrides,
-                        composition: { ...base, ...pins },
+                        composition: merged,
                     },
                 };
             }
@@ -367,6 +423,7 @@ export class SessionsImpl implements ISessions {
                     ? { subUseCase: config.subUseCase }
                     : {}),
             },
+            ...(config.origin === undefined ? {} : { origin: config.origin }),
             config: {
                 humanAvailable: config.humanAvailable ?? true,
                 ...(config.autoPermission === undefined
@@ -824,16 +881,19 @@ export class SessionsImpl implements ISessions {
     // The loop-facing drain (TakeAddedInputs): hand every pending message to
     // the live turn. Synchronous mutation — no interleaving with the
     // lock-holding paths' own synchronous queue access is possible.
-    private drainQueuedForSteer(
-        sessionId: string,
-    ): Array<z.infer<typeof UserMessage>> {
+    private drainQueuedForSteer(sessionId: string): AddedInput[] {
         const queue = this.pending.get(sessionId);
         if (!queue || queue.length === 0) {
             return [];
         }
-        const messages = queue.splice(0).map((entry) => entry.message);
+        const inputs = queue.splice(0).map((entry) => ({
+            message: entry.message,
+            ...(entry.config.origin === undefined
+                ? {}
+                : { origin: entry.config.origin }),
+        }));
         this.publishQueue(sessionId);
-        return messages;
+        return inputs;
     }
 
     private publishQueue(sessionId: string): void {
@@ -878,6 +938,39 @@ function parseActiveSkills(composition: JsonValue | undefined): string[] {
     return Array.isArray(value)
         ? value.filter((item): item is string => typeof item === "string")
         : [];
+}
+
+// A session born from an @rowboat mention (origin kind 'space_thread') is
+// pinned to its thread on every turn — whoever sends into it (the mention
+// path, the person chatting in the thread pane, a queued steer): the thread
+// procedure composes from token zero and the spaces tools attach at assembly.
+function spaceThreadPins(origin: SessionState["origin"]): Record<string, JsonValue> {
+    if (!origin || origin.kind !== "space_thread") return {};
+    return {
+        spaceThread: {
+            org: origin.orgId,
+            spaceName: origin.spaceName,
+            spaceId: origin.spaceId,
+            threadRootId: origin.threadRootId,
+        },
+        activeSkills: ["spaces"],
+    };
+}
+
+// A message that @-names a space, a person or a board (the composer's @ menu,
+// carried as userMessageContext.spaceMentions), or typed while a board is
+// open in Spaces (middlePane 'whiteboard'), is a spaces ask by construction:
+// the spaces skill — and the whiteboard skill when a board is in play — joins
+// this turn so the tools attach at assembly, instead of the model spending
+// its first call on loadSkill. activeSkills merges, and skills carry forward,
+// so the session stays capable afterwards — the same outcome loadSkill would
+// have produced.
+function spaceMentionPins(input: z.infer<typeof UserMessage>): Record<string, JsonValue> {
+    const mentions = input.userMessageContext?.spaceMentions ?? [];
+    const boardOpen = input.userMessageContext?.middlePane?.kind === "whiteboard";
+    const boardMentioned = mentions.some((m) => m.kind === "board");
+    if (mentions.length === 0 && !boardOpen) return {};
+    return { activeSkills: boardOpen || boardMentioned ? ["spaces", "whiteboard"] : ["spaces"] };
 }
 
 function deriveActiveSkills(turnState: TurnState): string[] {

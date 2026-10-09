@@ -29,6 +29,13 @@ export interface ChatMessage {
   content: string
   attachments?: MessageAttachment[]
   timestamp: number
+  /**
+   * A live in-flight model call's text, rendered through the SAME item slot
+   * (and id) its durable version will occupy so completion updates the node
+   * in place — no unmount/remount flash. Streaming items get the smoothed
+   * reveal; durable items render their content directly.
+   */
+  streaming?: boolean
 }
 
 export interface ToolCall {
@@ -61,6 +68,9 @@ export interface ReasoningMessage {
   kind: 'reasoning'
   content: string
   timestamp: number
+  /** Live thought stream for the in-flight model call (same in-place-update
+   * contract as ChatMessage.streaming); drives ReasoningRow's shimmer. */
+  streaming?: boolean
 }
 
 export type ReasoningEffortLevel = 'low' | 'medium' | 'high'
@@ -642,6 +652,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   'listMcpTools': 'Listing MCP tools',
   'executeMcpTool': 'Running MCP tool',
   'web-search': 'Searching the web',
+  'generate-image': 'Generating image',
   'save-to-memory': 'Saving to memory',
   'app-navigation': 'Navigating app',
   'browser-control': 'Controlling browser',
@@ -858,6 +869,14 @@ export const getToolRowSummary = (tool: ToolCall): ToolRowSummary => {
         verb: 'Web search',
         detail: asString(input?.query) ? `"${input!.query}"` : undefined,
         stat: done && results !== undefined ? plural(results, 'result') : undefined,
+      }
+    }
+    case 'generate-image': {
+      const failed = done && asRecord(tool.result)?.success === false
+      return {
+        verb: 'Generate image',
+        detail: asString(input?.prompt)?.slice(0, 64),
+        stat: failed ? 'failed' : undefined,
       }
     }
     case 'save-to-memory':

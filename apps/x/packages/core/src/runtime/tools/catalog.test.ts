@@ -205,13 +205,98 @@ const HISTORICAL_KEY_ORDER = [
     "todo-add",
     "todo-propose",
     "todo-report",
+    "deck-create",
+    "deck-add-slide",
+    "deck-edit-slide",
+    "deck-restructure",
+    "deck-restyle",
+    "deck-review",
     "screen-pointer",
     "text-to-speech",
     "transcribe-audio",
     "home-status",
     "paste-at-cursor",
+    "spreadsheet-create",
+    "spreadsheet-edit",
+    "generate-image",
+    "whoami",
+    "list_members",
+    "list_spaces",
+    "browse_spaces",
+    "list_assets",
+    "join_space",
+    "open_direct",
+    "create_space",
+    "rename_space",
+    "add_members",
+    "leave_space",
+    "create_invite",
+    "read_stream",
+    "read_thread",
+    "read_activity",
+    "mark_all_read",
+    "search_space",
+    "post_message",
+    "get_invocations",
+    "stop_invocation",
+    "edit_message",
+    "delete_message",
+    "react",
+    "vote_poll",
+    "end_poll",
+    "list_topics",
+    "create_topic",
+    "manage_topic",
+    "create_asset",
+    "read_asset",
+    "propose_change",
+    "move_asset",
+    "delete_asset",
+    "restore_asset",
+    "asset_history",
+    "diff",
+    "spaces-upload-blob",
+    "spaces-download-blob",
+    "schedule_message",
+    "list_scheduled",
+    "cancel_scheduled",
+    "whiteboard-read",
+    "whiteboard-draw",
     "spawn-agent",
 ];
+
+// A skill's declared tool names are resolved against this catalog at
+// loadSkill time, and an unknown name is only a console.warn — so a typo
+// silently means "the model never gets that tool". Pin the bundled skills'
+// declarations against the live catalog instead.
+describe("bundled skills declare real builtin tools", () => {
+    it("every tool name a bundled skill attaches exists in BuiltinTools", async () => {
+        const { skillToolNames, availableSkills } = await import(
+            "../assembly/skills/index.js"
+        );
+        const unknown: string[] = [];
+        for (const skillId of availableSkills) {
+            for (const name of skillToolNames(skillId)) {
+                if (!BuiltinTools[name]) unknown.push(`${skillId} -> ${name}`);
+            }
+        }
+        expect(unknown).toEqual([]);
+    });
+
+    it("the presentations skill attaches the deck tools", async () => {
+        const { skillToolNames } = await import("../assembly/skills/index.js");
+        expect(skillToolNames("create-presentations")).toEqual(
+            expect.arrayContaining([
+                "deck-create",
+                "deck-review",
+                "deck-add-slide",
+                "deck-edit-slide",
+                "deck-restructure",
+                "deck-restyle",
+            ]),
+        );
+    });
+});
 
 describe("BuiltinTools catalog key order", () => {
     it("preserves the historical key order byte-for-byte", () => {
@@ -243,6 +328,14 @@ describe("BuiltinTools permission audit", () => {
             "file-mkdir": "file-boundary",
             parseFile: "file-boundary",
             LLMParse: "file-boundary",
+            "deck-create": "file-boundary",
+            "deck-add-slide": "file-boundary",
+            "deck-edit-slide": "file-boundary",
+            "deck-restructure": "file-boundary",
+            "deck-restyle": "file-boundary",
+            "deck-review": "file-boundary",
+            "spreadsheet-create": "file-boundary",
+            "spreadsheet-edit": "file-boundary",
             executeCommand: "command-allowlist",
             addMcpServer: "prompt",
             executeMcpTool: "mcp-execute",
@@ -252,6 +345,41 @@ describe("BuiltinTools permission audit", () => {
             // Ghostwriter: types into ANOTHER app at the user's cursor —
             // always gated (the auto judge keeps voice flow smooth).
             "paste-at-cursor": "prompt",
+            // Spaces blob bridge: upload pushes local bytes toward a
+            // team-visible org, so it's gated (the auto judge decides);
+            // download is deliberately "none" — a member-readable fetch into
+            // the app-owned cache.
+            // The projected agent face: every org write is gated; reads
+            // (whoami, list_*, read_*, search, history, diff) are "none".
+            join_space: "prompt",
+            open_direct: "prompt",
+            create_space: "prompt",
+            rename_space: "prompt",
+            add_members: "prompt",
+            leave_space: "prompt",
+            create_invite: "prompt",
+            post_message: "prompt",
+            stop_invocation: "prompt",
+            edit_message: "prompt",
+            delete_message: "prompt",
+            react: "prompt",
+            vote_poll: "prompt",
+            end_poll: "prompt",
+            create_topic: "prompt",
+            manage_topic: "prompt",
+            // Personal state, but irreversible (marks only advance) — gated like a write.
+            mark_all_read: "prompt",
+            create_asset: "prompt",
+            propose_change: "prompt",
+            move_asset: "prompt",
+            delete_asset: "prompt",
+            restore_asset: "prompt",
+            "spaces-upload-blob": "prompt",
+            // Local: a scheduled send still lands in front of the team.
+            schedule_message: "prompt",
+            // Whiteboards: a draw is a propose_change on a shared board;
+            // the read is a member-readable snapshot summary.
+            "whiteboard-draw": "prompt",
         });
     });
 });

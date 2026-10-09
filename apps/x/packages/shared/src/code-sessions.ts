@@ -21,6 +21,12 @@ export const GitRepoInfo = z.object({
     branch: z.string().nullable(),
     hasCommits: z.boolean(),
     dirtyCount: z.number(),
+    // The repository's top-level directory (real path) and where the project
+    // sits inside it ("" when the project IS the root; "apps/x" for a package
+    // in a monorepo). Both null outside a repo. Lets a project be labelled
+    // "rowboat/apps/x" instead of a bare "x".
+    root: z.string().nullable(),
+    subpath: z.string().nullable(),
 });
 export type GitRepoInfo = z.infer<typeof GitRepoInfo>;
 
@@ -31,10 +37,10 @@ export type CodeSessionStatus = z.infer<typeof CodeSessionStatus>;
 export const CodeWorktree = z.object({
     path: z.string(),
     branch: z.string(),
-    // Branch the original checkout was on when the worktree was created;
-    // merge-back targets whatever the checkout is on at merge time, this is
-    // informational.
+    // Selected base branch when this shared worktree was created.
     baseBranch: z.string().nullable(),
+    // Exact starting commit; absent on legacy worktrees, which cannot switch base.
+    baseCommit: z.string().optional(),
     mergedAt: z.iso.datetime().optional(),
     removedAt: z.iso.datetime().optional(),
 });
@@ -45,6 +51,8 @@ export const CodeSession = z.object({
     projectId: z.string(),
     title: z.string(),
     agent: CodingAgent,
+    // Missing on older coding sessions means enabled. Projects can opt out.
+    codeModeEnabled: z.boolean().optional(),
     // Absent = the user never chose — each run resolves chip → global
     // settings → ask. Stored ONLY on an explicit user choice (the new-
     // session dialog, the Code rail's approvals select); adoption and
@@ -54,9 +62,14 @@ export const CodeSession = z.object({
     // Where the agent works: the project path, or the worktree path.
     cwd: z.string(),
     worktree: CodeWorktree.optional(),
+    workspaceId: z.string().optional(),
     // The coding agent's own model + reasoning effort (applied to the ACP engine,
     // not the Rowboat-mode LLM). Values come from CODE_AGENT_MODELS /
     // CODE_AGENT_EFFORTS; unset (or 'default') leaves the engine's own default.
+    // Set when the user marks the session done (rail check, menus). Nothing
+    // on disk changes — worktree, branch and chat stay; the rail just files
+    // the session under Done. Cleared by activity (a new turn) or Reopen.
+    doneAt: z.iso.datetime().optional(),
     agentModel: z.string().optional(),
     agentEffort: z.string().optional(),
     createdAt: z.iso.datetime(),
@@ -93,3 +106,11 @@ export const GitStatusFile = z.object({
     deletions: z.number().nullable(),
 });
 export type GitStatusFile = z.infer<typeof GitStatusFile>;
+
+// The absolute worktree path is its stable shared identity. Existing session
+// files already contain it, so older conversations join their workspace without
+// rewriting history or moving directories. New in-place threads have explicit
+// workspace ids; older in-repo sessions retain their cwd-based grouping.
+export function codeWorkspaceKey(session: CodeSession): string {
+    return JSON.stringify([session.projectId, session.worktree?.path ?? session.workspaceId ?? session.cwd]);
+}

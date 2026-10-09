@@ -375,7 +375,7 @@ module.exports = {
             fs.mkdirSync(packageDir, { recursive: true });
 
             // Build order matters! Dependencies must be built before dependents:
-            // shared → core → (renderer, preload, main)
+            // shared → spaces-client → core → (renderer, preload, main)
 
             // Build shared (TypeScript compilation) - no dependencies
             console.log('Building shared...');
@@ -384,10 +384,34 @@ module.exports = {
                 stdio: 'inherit'
             });
 
-            // Build core (TypeScript compilation) - depends on shared
+            // Build spaces-client (TypeScript compilation) - the Harbor client;
+            // core, server and main import it
+            console.log('Building spaces-client...');
+            execSync('pnpm run build', {
+                cwd: path.join(__dirname, '../../packages/spaces-client'),
+                stdio: 'inherit'
+            });
+
+            // Build core (TypeScript compilation) - depends on shared, spaces-client
             console.log('Building core...');
             execSync('pnpm run build', {
                 cwd: path.join(__dirname, '../../packages/core'),
+                stdio: 'inherit'
+            });
+
+            // Build server (TypeScript compilation) - depends on shared, core;
+            // main imports it for the hosted rowboat-server transport
+            console.log('Building server...');
+            execSync('pnpm run build', {
+                cwd: path.join(__dirname, '../server'),
+                stdio: 'inherit'
+            });
+
+            // Build client (TypeScript compilation) - depends on shared;
+            // main imports it for the child-server events bridge
+            console.log('Building client...');
+            execSync('pnpm run build', {
+                cwd: path.join(__dirname, '../../packages/client'),
                 stdio: 'inherit'
             });
 
@@ -395,6 +419,14 @@ module.exports = {
             console.log('Building renderer...');
             execSync('pnpm run build', {
                 cwd: path.join(__dirname, '../renderer'),
+                // The production renderer bundle exceeds Node's default heap on
+                // GitHub's macOS ARM runners while Vite renders/compresses chunks.
+                // Keep this scoped to the memory-intensive child process instead
+                // of changing the heap for Forge or the rest of the build.
+                env: {
+                    ...process.env,
+                    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --max-old-space-size=4096`.trim(),
+                },
                 stdio: 'inherit'
             });
 

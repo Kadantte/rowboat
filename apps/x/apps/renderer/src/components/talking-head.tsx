@@ -28,6 +28,7 @@ export type MascotHat =
   | 'explorer'
   | 'party'
   | 'cowboy'
+  | 'sailor'
 
 type TalkingHeadProps = {
   ttsState: TTSState
@@ -490,17 +491,40 @@ function MascotHatArt({ hat }: { hat: MascotHat }) {
           <path d="M 48 34 Q 38 20 54 27 C 68 33 82 34 100 34 C 118 34 132 33 146 27 Q 162 20 152 34 Q 138 48 100 48 Q 62 48 48 34 Z" fill="#CE9455" {...outline} />
         </g>
       )
+    case 'sailor':
+      // The crew's white Dixie cup (Spaces stop): soft dome, rolled-up brim
+      // with a navy edge.
+      return (
+        <g>
+          <path d="M 72 40 Q 100 0 128 40 Z" fill="#F4F5F9" {...outline} />
+          <path d="M 62 42 Q 100 30 138 42 Q 136 54 100 56 Q 64 54 62 42 Z" fill="#FFFFFF" {...outline} />
+          <path d="M 68 42 Q 100 33 132 42" fill="none" stroke="#3D68B8" strokeWidth="3.5" strokeLinecap="round" />
+        </g>
+      )
   }
 }
 
 /** Small static mascot face used as the toolbar toggle icon. */
-export function MascotFaceIcon({ className }: { className?: string }) {
+export function MascotFaceIcon({ className, size = 16, style }: { className?: string; size?: number | string; style?: React.CSSProperties }) {
+  // The Rowboat mark as a 24px outline glyph (from rowboat-assistant-outline.svg),
+  // stroke-scaled to match a 1.5px icon set. currentColor so it inks like any
+  // sidebar/dock glyph.
   return (
-    <svg viewBox="0 0 24 24" width="16" height="16" className={className} aria-hidden="true">
-      <circle cx="12" cy="12" r="9.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
-      <ellipse cx="8.6" cy="10.5" rx="1.3" ry="1.8" fill="currentColor" />
-      <ellipse cx="15.4" cy="10.5" rx="1.3" ry="1.8" fill="currentColor" />
-      <path d="M 9 14.5 Q 12 17 15 14.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      style={style}
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeLinejoin="round"
+      strokeLinecap="round"
+      aria-hidden="true"
+    >
+      <g transform="translate(12 12) scale(0.0245) translate(-497 -489)" strokeWidth="61">
+        <path d="M 158 487 C 330 330, 620 180, 837 148 C 820 480, 640 720, 498 830 Q 550 720, 569 623 C 560 540, 450 440, 352 413 Q 250 440, 158 487 Z" />
+      </g>
     </svg>
   )
 }

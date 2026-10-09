@@ -1,7 +1,8 @@
+import { markWorkspaceStarted, workspaceHasStarted } from './workspace-started.js';
 import path from 'path';
 import fs from 'fs/promises';
 import { WorkDir } from '../../config/config.js';
-import type { CodeSession } from '@x/shared/dist/code-sessions.js';
+import { codeWorkspaceKey, type CodeSession } from '@x/shared/dist/code-sessions.js';
 import type { CodingAgent, ApprovalPolicy } from '@x/shared/dist/code-mode.js';
 import type { ISessions } from '../../runtime/sessions/api.js';
 import type { ISessionRepo } from '../../runtime/sessions/repo.js';
@@ -17,11 +18,14 @@ export interface CreateSessionArgs {
     projectId: string;
     title?: string;
     agent: CodingAgent;
+    codeModeEnabled?: boolean;
     // Only pass a policy the USER explicitly chose (dialog, rail select).
     // Adoption/dispatch leave it unset — runs then resolve chip → global
     // settings → ask, so the stored field always means "the user chose".
     policy?: ApprovalPolicy;
     isolation: 'in-repo' | 'worktree';
+    baseBranch?: string;
+    workspaceSessionId?: string;
     // The coding agent's own model + reasoning effort (ACP engine); unset leaves
     // the engine default. Re-applied to the ACP session on every turn.
     agentModel?: string;
@@ -32,8 +36,8 @@ export interface CreateSessionArgs {
     cwd?: string;
 }
 
-function worktreeRoot(projectId: string, sessionId: string): string {
-    return path.join(WorkDir, 'code-mode', 'worktrees', projectId, sessionId);
+function worktreeRoot(projectPath: string, sessionId: string): string {
+    return path.join(projectPath, '.rowboat', 'worktrees', sessionId);
 }
 
 // The per-chat work directory the copilot anchors its general context to
@@ -85,6 +89,10 @@ export class CodeSessionService {
         this.codeSessionsRepo = codeSessionsRepo;
         this.codeProjectsRepo = codeProjectsRepo;
         this.sessionBus = sessionBus;
+        this.sessionBus.subscribe((event) => {
+            if (event.kind !== 'index-changed' || !event.entry?.title) return;
+            void this.adoptChatTitle(event.sessionId, event.entry.title);
+        });
     }
 
     // Sessions created before code mode moved onto the turns runtime have meta
@@ -121,6 +129,32 @@ export class CodeSessionService {
         await fs.writeFile(marker, new Date().toISOString()).catch(() => {});
     }
 
+    async migrateLegacyProjects(): Promise<void> {
+        await withFileLock('projects-unification', async () => {
+            const marker = path.join(WorkDir, 'config', '.projects-unified');
+            try { await fs.access(marker); return; } catch { /* first migration */ }
+            const { listProjects } = await import('../../projects/projects.js');
+            let incomplete = false;
+            const liveIds = new Set(this.sessions.listSessions().map((s) => s.sessionId));
+            for (const legacy of await listProjects(this.sessions)) {
+                const project = await this.codeProjectsRepo.add(path.join(WorkDir, legacy.path));
+                for (const chat of legacy.chats) {
+                    // The legacy runtime still owns chats not converted to sessions.
+                    if (!liveIds.has(chat.id)) { incomplete = true; continue; }
+                    const workDirFile = path.join(WorkDir, 'config', `workdir-${chat.id}.json`);
+                    const saved = await fs.readFile(workDirFile, 'utf8').then((raw) => JSON.parse(raw)).catch(() => null);
+                    await this.createForSession(chat.id, {
+                        projectId: project.id, title: chat.title, agent: 'claude',
+                        isolation: 'in-repo', codeModeEnabled: false,
+                        ...(typeof saved?.path === 'string' ? { cwd: saved.path } : {}),
+                    });
+                }
+            }
+            await fs.mkdir(path.dirname(marker), { recursive: true });
+            if (!incomplete) await fs.writeFile(marker, new Date().toISOString());
+        });
+    }
+
     async create(args: CreateSessionArgs): Promise<CodeSession> {
         const project = await this.codeProjectsRepo.get(args.projectId);
         if (!project) throw new Error(`Unknown project: ${args.projectId}`);
@@ -128,9 +162,35 @@ export class CodeSessionService {
         // The session is a real chat session, created first so its id becomes
         // the code session id. Everything chat (messaging, stop, permission
         // cards, history) works on it with no code-mode special casing.
-        const title = args.title?.trim() || `${project.name} session`;
-        const sessionId = await this.sessions.createSession({ title });
-        return this.createForSession(sessionId, { ...args, title });
+        //
+        // No name given → the chat is created UNTITLED so the runtime titles
+        // it from the first message (a placeholder, then a generated title);
+        // the index-changed subscription in the constructor carries that into
+        // the meta. Until then the meta wears a project-name placeholder so
+        // the rail has something to show.
+        const explicit = args.title?.trim();
+        const sessionId = await this.sessions.createSession(explicit ? { title: explicit } : undefined);
+        try {
+            return await this.createForSession(sessionId, { ...args, title: explicit || `${project.name} session` });
+        } catch (error) {
+            await this.sessions.deleteSession(sessionId).catch(() => {});
+            throw error;
+        }
+    }
+
+    // Code sessions show the CHAT's title (rail, chat header). The runtime
+    // titles untitled chats from their first message and renames flow through
+    // the index; mirror those into the meta so every list of code sessions
+    // stays in step. A rename made here (update → sessions.setTitle) comes
+    // back as an equal title and is a no-op.
+    private async adoptChatTitle(sessionId: string, title: string): Promise<void> {
+        try {
+            const meta = await this.codeSessionsRepo.get(sessionId);
+            if (!meta || meta.title === title) return;
+            await this.codeSessionsRepo.save({ ...meta, title });
+        } catch {
+            // Observational — a missed title never affects the session.
+        }
     }
 
     /**
@@ -161,7 +221,7 @@ export class CodeSessionService {
         // then works in a worktree the system has no record of. The whole
         // read → (worktree) → save sequence runs under a per-session lock;
         // the loser re-reads the winner's meta and returns it.
-        return withFileLock(`code-session-adopt:${sessionId}`, async () => {
+        return withFileLock(`code-workspaces:${project.id}`, () => withFileLock(`code-session-adopt:${sessionId}`, async () => {
             const existing = await this.codeSessionsRepo.get(sessionId);
             if (existing) return existing;
 
@@ -175,15 +235,27 @@ export class CodeSessionService {
 
             let cwd = args.cwd ?? project.path;
             let worktree: CodeSession['worktree'];
-            if (args.isolation === 'worktree') {
-                const info = await gitService.repoInfo(project.path);
-                if (!info.isGitRepo || !info.hasCommits) {
-                    throw new Error('Worktree isolation needs a git repository with at least one commit.');
-                }
+            let workspaceId = sessionId;
+            let codeModeEnabled = args.codeModeEnabled;
+            const info = args.workspaceSessionId ? null : await gitService.repoInfo(project.path);
+            if (args.workspaceSessionId) {
+                const source = await this.codeSessionsRepo.get(args.workspaceSessionId);
+                if (!source || source.projectId !== project.id) throw new Error('Workspace no longer exists in this project.');
+                if (source.worktree?.removedAt) throw new Error('This worktree has been removed.');
+                await fs.access(source.cwd);
+                cwd = source.cwd;
+                workspaceId = source.workspaceId ?? source.cwd;
+                codeModeEnabled ??= source.codeModeEnabled ?? true;
+                worktree = source.worktree ? { ...source.worktree } : undefined;
+            } else if (args.isolation === 'worktree' && info?.isGitRepo) {
                 const branch = `rowboat/${sessionId}`;
-                const wtPath = worktreeRoot(project.id, sessionId);
-                await gitService.worktreeAdd(project.path, wtPath, branch);
-                worktree = { path: wtPath, branch, baseBranch: info.branch };
+                const wtPath = worktreeRoot(project.path, sessionId);
+                const baseBranch = args.baseBranch ?? info.branch ?? 'HEAD';
+                await gitService.excludeWorktrees(project.path);
+                const baseCommit = info.hasCommits
+                    ? await gitService.worktreeAdd(project.path, wtPath, branch, baseBranch)
+                    : await gitService.worktreeAddUnborn(project.path, wtPath, branch);
+                worktree = { path: wtPath, branch, baseBranch, baseCommit };
                 cwd = wtPath;
             }
 
@@ -192,6 +264,8 @@ export class CodeSessionService {
                 projectId: project.id,
                 title,
                 agent: args.agent,
+                codeModeEnabled: codeModeEnabled ?? info?.isGitRepo ?? false,
+                workspaceId,
                 // Never freeze a transient posture: policy is stored only
                 // when the caller carries an explicit user choice.
                 ...(args.policy ? { policy: args.policy } : {}),
@@ -202,13 +276,16 @@ export class CodeSessionService {
                 createdAt: new Date().toISOString(),
             };
             await this.codeSessionsRepo.save(session);
+            if (worktree && (await this.sessions.getSession(sessionId)).turns?.length) {
+                await markWorkspaceStarted(session);
+            }
             await persistRunWorkDir(sessionId, cwd);
             // One identity-change event; every "what kind of session is
             // this" cache (status tracker, Home registry, future ones)
             // corrects itself from the bus instead of per-cache hand-pokes.
             this.sessionBus.publish({ kind: 'code-adopted', sessionId });
             return session;
-        });
+        }));
     }
 
     /**
@@ -280,16 +357,55 @@ export class CodeSessionService {
         return best;
     }
 
-    async update(sessionId: string, patch: Partial<Pick<CodeSession, 'title' | 'policy' | 'agent' | 'agentModel' | 'agentEffort'>>): Promise<CodeSession> {
+    async update(sessionId: string, patch: Partial<Pick<CodeSession, 'title' | 'policy' | 'agent' | 'agentModel' | 'agentEffort' | 'codeModeEnabled'>> & { clearPolicy?: boolean }): Promise<CodeSession> {
         const session = await this.codeSessionsRepo.get(sessionId);
         if (!session) throw new Error(`Unknown session: ${sessionId}`);
-        const updated: CodeSession = { ...session, ...patch };
+        const { clearPolicy, ...values } = patch;
+        const updated: CodeSession = { ...session, ...values };
+        if (clearPolicy) delete updated.policy;
+        // Model and effort are ids of ONE engine's catalog — a Codex model on
+        // a Claude Code session is nonsense. Switching agents drops them back
+        // to the engine default unless the same patch chooses new ones.
+        if (patch.agent && patch.agent !== session.agent) {
+            if (patch.agentModel === undefined) delete updated.agentModel;
+            if (patch.agentEffort === undefined) delete updated.agentEffort;
+        }
         await this.codeSessionsRepo.save(updated);
         if (patch.title && patch.title !== session.title) {
             // Keep the chat session's title (history list, notifications) in sync.
             await this.sessions.setTitle(sessionId, patch.title).catch(() => {});
         }
         return updated;
+    }
+
+    // Done is the user's own verdict on a session (or the natural end of a
+    // merge-back). Worktree, branch and chat all stay on disk, so reopening
+    // is just clearing the flag — but the session's terminal PTY is killed:
+    // done means nothing keeps running on the session's behalf (a dev server
+    // or watcher left in the shell). The pane respawns a fresh shell on the
+    // next attach. Activity clears the flag too (status tracker) so a done
+    // session that gets a message comes back.
+    async setDone(sessionId: string, done: boolean): Promise<CodeSession> {
+        const session = await this.codeSessionsRepo.get(sessionId);
+        if (!session) throw new Error(`Unknown session: ${sessionId}`);
+        const updated: CodeSession = { ...session };
+        if (done) updated.doneAt = new Date().toISOString();
+        else delete updated.doneAt;
+        await this.codeSessionsRepo.save(updated);
+        if (done) await this.killTerminal(sessionId);
+        return updated;
+    }
+
+    // Best-effort PTY kill, shared by every path that files a session under
+    // Done. Dynamic import keeps node-pty (native) off the module graph of
+    // anything that merely imports this service.
+    private async killTerminal(sessionId: string): Promise<void> {
+        try {
+            const { disposeTerminal } = await import('../../terminal/terminal.js');
+            disposeTerminal(sessionId);
+        } catch {
+            // No terminal module or no PTY — never blocks Done.
+        }
     }
 
     // Stop whatever turn is live on the session's chat. The turn's abort
@@ -306,52 +422,117 @@ export class CodeSessionService {
         }
     }
 
-    async mergeBack(sessionId: string): Promise<gitService.MergeBackResult> {
+    private async workspaceMembers(session: CodeSession): Promise<CodeSession[]> {
+        return (await this.codeSessionsRepo.list()).filter((other) => codeWorkspaceKey(other) === codeWorkspaceKey(session));
+    }
+
+    async baseBranchStatus(sessionId: string): Promise<{ canChange: boolean; reason: string | null; baseBranch: string | null }> {
         const session = await this.codeSessionsRepo.get(sessionId);
-        if (!session?.worktree) {
-            return { ok: false, message: 'This session has no isolated worktree to merge.' };
+        let reason: string | null = null;
+        if (!session?.worktree || session.worktree.removedAt) reason = 'This worktree is no longer available.';
+        else if (session.worktree.mergedAt) reason = 'This worktree has already been merged.';
+        else {
+            let started = await workspaceHasStarted(session);
+            for (const member of await this.workspaceMembers(session)) {
+                // Fail closed if history cannot be read; no best-effort reset.
+                const state = await this.sessions.getSession(member.id);
+                if (state.turns.length > 0 || member.lastActivityAt) started = true;
+            }
+            if (started) {
+                await markWorkspaceStarted(session);
+                reason = "Base branch can't be changed after a session has started.";
+            } else reason = await gitService.worktreeBaseChangeReason(session.cwd, session.worktree.branch, session.worktree.baseCommit);
         }
-        const project = await this.codeProjectsRepo.get(session.projectId);
-        if (!project) {
-            return { ok: false, message: 'The session\'s project is no longer registered.' };
-        }
-        const result = await gitService.mergeBack(project.path, session.worktree.branch);
-        if (result.ok) {
-            await this.codeSessionsRepo.save({
-                ...session,
-                worktree: { ...session.worktree, mergedAt: new Date().toISOString() },
-            });
-        }
-        return result;
+        return { canChange: reason === null, reason, baseBranch: session?.worktree?.baseBranch ?? null };
+    }
+
+    async changeBaseBranch(sessionId: string, baseBranch: string): Promise<void> {
+        const meta = await this.codeSessionsRepo.get(sessionId);
+        if (!meta) throw new Error('Session no longer exists.');
+        await withFileLock(`code-workspaces:${meta.projectId}`, async () => {
+            const members = (await this.workspaceMembers(meta)).sort((a, b) => a.id.localeCompare(b.id));
+            // The runtime holds these same locks while accepting first messages.
+            // A base change and a session start therefore cannot interleave.
+            const lockMembers = async (index: number): Promise<void> => {
+                if (index < members.length) return this.sessionRepo.withLock(members[index].id, () => lockMembers(index + 1));
+                const status = await this.baseBranchStatus(sessionId);
+                if (!status.canChange) throw new Error(status.reason!);
+                const session = (await this.codeSessionsRepo.get(sessionId))!;
+                for (const member of members) {
+                    this.codeModeManager.dispose(member.id);
+                    await this.killTerminal(member.id);
+                }
+                const baseCommit = await gitService.changeWorktreeBase(session.cwd, session.worktree!.branch, session.worktree!.baseCommit!, baseBranch);
+                for (const member of members) {
+                    const current = await this.codeSessionsRepo.get(member.id);
+                    if (current) await this.codeSessionsRepo.save({ ...current, worktree: { ...current.worktree!, baseBranch, baseCommit } });
+                }
+            };
+            await lockMembers(0);
+        });
+    }
+
+    async mergeBack(sessionId: string): Promise<gitService.MergeBackResult> {
+        const meta = await this.codeSessionsRepo.get(sessionId);
+        if (!meta) return { ok: false, message: 'Session no longer exists.' };
+        return withFileLock(`code-workspaces:${meta.projectId}`, async () => {
+            const session = await this.codeSessionsRepo.get(sessionId);
+            if (!session?.worktree || session.worktree.removedAt) {
+                return { ok: false, message: 'This session has no isolated worktree to merge.' };
+            }
+            const project = await this.codeProjectsRepo.get(session.projectId);
+            if (!project) return { ok: false, message: "The session's project is no longer registered." };
+            const result = await gitService.mergeBack(project.path, session.worktree.branch);
+            if (result.ok) {
+                const now = new Date().toISOString();
+                for (const member of await this.workspaceMembers(session)) {
+                    await this.codeSessionsRepo.save({ ...member, worktree: { ...member.worktree!, mergedAt: now }, doneAt: member.doneAt ?? now });
+                    await this.killTerminal(member.id);
+                }
+            }
+            return result;
+        });
     }
 
     async cleanupWorktree(sessionId: string, deleteBranch: boolean): Promise<void> {
-        const session = await this.codeSessionsRepo.get(sessionId);
-        if (!session?.worktree || session.worktree.removedAt) return;
-        const project = await this.codeProjectsRepo.get(session.projectId);
-        // Drop any live agent connection on the worktree before deleting it.
-        this.codeModeManager.dispose(sessionId);
-        if (project) {
+        const meta = await this.codeSessionsRepo.get(sessionId);
+        if (!meta) return;
+        return withFileLock(`code-workspaces:${meta.projectId}`, async () => {
+            const session = await this.codeSessionsRepo.get(sessionId);
+            if (!session?.worktree || session.worktree.removedAt) return;
+            const project = await this.codeProjectsRepo.get(session.projectId);
+            if (!project) throw new Error('The project is no longer registered.');
+            const members = await this.workspaceMembers(session);
+            for (const member of members) {
+                await this.stop(member.id);
+                this.codeModeManager.dispose(member.id);
+                await this.killTerminal(member.id);
+            }
             await gitService.worktreeRemove(project.path, session.worktree.path, {
                 force: true,
                 ...(deleteBranch ? { deleteBranch: session.worktree.branch } : {}),
             });
-        }
-        const nextCwd = project?.path ?? session.cwd;
-        await this.codeSessionsRepo.save({
-            ...session,
-            // The worktree is gone — fall back to working directly in the repo.
-            cwd: nextCwd,
-            worktree: { ...session.worktree, removedAt: new Date().toISOString() },
+            for (const member of members) {
+                await this.codeSessionsRepo.save({
+                    ...member, cwd: project.path,
+                    worktree: { ...member.worktree!, removedAt: new Date().toISOString() },
+                });
+                await persistRunWorkDir(member.id, project.path);
+            }
         });
-        await persistRunWorkDir(sessionId, nextCwd);
     }
 
     async delete(sessionId: string, opts: { removeWorktree?: boolean; deleteBranch?: boolean } = {}): Promise<void> {
+        const meta = await this.codeSessionsRepo.get(sessionId);
+        return withFileLock(`code-workspaces:${meta?.projectId ?? sessionId}`, () => this.deleteUnlocked(sessionId, opts));
+    }
+
+    private async deleteUnlocked(sessionId: string, opts: { removeWorktree?: boolean; deleteBranch?: boolean }): Promise<void> {
         await this.stop(sessionId);
         this.codeModeManager.dispose(sessionId);
         const session = await this.codeSessionsRepo.get(sessionId);
-        if (opts.removeWorktree && session?.worktree && !session.worktree.removedAt) {
+        if (opts.removeWorktree && session?.worktree && !session.worktree.removedAt
+            && (await this.workspaceMembers(session)).length === 1) {
             const project = await this.codeProjectsRepo.get(session.projectId);
             if (project) {
                 await gitService.worktreeRemove(project.path, session.worktree.path, {

@@ -1,3 +1,4 @@
+import { projectSessionComposition } from '../../code-mode/sessions/composition.js';
 import { describe, expect, it } from "vitest";
 import type { z } from "zod";
 import type { SessionBusEvent, SessionEvent } from "@x/shared/dist/sessions.js";
@@ -327,7 +328,7 @@ class FlakySessionRepo implements ISessionRepo {
     }
 }
 
-function makeSessions(opts: { repo?: ISessionRepo; fake?: FakeTurnRuntime } = {}) {
+function makeSessions(opts: { sessionCompositionPins?: ConstructorParameters<typeof SessionsImpl>[0]['sessionCompositionPins']; repo?: ISessionRepo; fake?: FakeTurnRuntime; beforeSessionStart?: (id: string) => Promise<void> } = {}) {
     const repo = opts.repo ?? new InMemorySessionRepo();
     const fake = opts.fake ?? new FakeTurnRuntime();
     const bus = new RecordingBus();
@@ -337,6 +338,8 @@ function makeSessions(opts: { repo?: ISessionRepo; fake?: FakeTurnRuntime } = {}
         idGenerator: new FakeIdGen(),
         clock: new FakeClock(),
         sessionBus: bus,
+        beforeSessionStart: opts.beforeSessionStart,
+        sessionCompositionPins: opts.sessionCompositionPins,
     });
     return { sessions, repo, fake, bus };
 }
@@ -366,6 +369,23 @@ describe("createSession and listing", () => {
         ]);
         expect(bus.events).toEqual([
             expect.objectContaining({ kind: "index-changed", sessionId }),
+        ]);
+    });
+
+    it("stamps a session origin on session_created and folds it into the index entry", async () => {
+        const { sessions, repo } = makeSessions();
+        const origin = {
+            kind: "space_thread" as const,
+            orgId: "org-1",
+            spaceId: "space-1",
+            threadRootId: "root-1",
+            spaceName: "Roadboard",
+        };
+        const sessionId = await sessions.createSession({ title: "SSO first?", origin });
+        const [created] = await (repo as InMemorySessionRepo).read(sessionId);
+        expect(created).toEqual(expect.objectContaining({ type: "session_created", origin }));
+        expect(sessions.listSessions()).toEqual([
+            expect.objectContaining({ sessionId, title: "SSO first?", origin }),
         ]);
     });
 });
@@ -1024,112 +1044,113 @@ describe("startup scan (13.6)", () => {
     });
 });
 
+const skillTool = {
+    toolId: "builtin:file-writeText",
+    name: "file-writeText",
+    description: "Write",
+    inputSchema: {},
+    execution: "sync" as const,
+    requiresHuman: false,
+};
+
+// A completed turn whose history loaded a skill mid-turn.
+function skillLoadLog(
+    turnId: string,
+    sessionId: string,
+    agent: CreateTurnInput["agent"],
+    source = "organize-files",
+): TEvent[] {
+    const created = createdEvent(turnId, {
+        agent,
+        sessionId,
+        context: [],
+        input: user("hi"),
+        config: { humanAvailable: true },
+    });
+    return [
+        created,
+        {
+            type: "model_call_requested",
+            turnId,
+            ts: TS,
+            modelCallIndex: 0,
+            request: { messages: ["input"], parameters: {} },
+        },
+        {
+            type: "model_call_completed",
+            turnId,
+            ts: TS,
+            modelCallIndex: 0,
+            message: {
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool-call",
+                        toolCallId: "A",
+                        toolName: "loadSkill",
+                        arguments: {},
+                    },
+                ],
+            },
+            finishReason: "tool-calls",
+            usage: {},
+        },
+        {
+            type: "tool_invocation_requested",
+            turnId,
+            ts: TS,
+            toolCallId: "A",
+            toolId: "builtin:loadSkill",
+            toolName: "loadSkill",
+            execution: "sync",
+            input: {},
+        },
+        {
+            type: "tool_result",
+            turnId,
+            ts: TS,
+            toolCallId: "A",
+            toolName: "loadSkill",
+            source: "sync",
+            result: { output: { success: true }, isError: false },
+        },
+        {
+            type: "tools_extended",
+            turnId,
+            ts: TS,
+            toolCallId: "A",
+            source,
+            tools: [skillTool],
+        },
+        {
+            type: "model_call_requested",
+            turnId,
+            ts: TS,
+            modelCallIndex: 1,
+            request: { messages: ["assistant:0", "toolResult:A"], parameters: {} },
+        },
+        {
+            type: "model_call_completed",
+            turnId,
+            ts: TS,
+            modelCallIndex: 1,
+            message: assistantText("ok"),
+            finishReason: "stop",
+            usage: {},
+        },
+        {
+            type: "turn_completed",
+            turnId,
+            ts: TS,
+            output: assistantText("ok"),
+            finishReason: "stop",
+            usage: {},
+        },
+    ];
+}
+
+
 describe("active-skill carry-forward", () => {
-    const skillTool = {
-        toolId: "builtin:file-writeText",
-        name: "file-writeText",
-        description: "Write",
-        inputSchema: {},
-        execution: "sync" as const,
-        requiresHuman: false,
-    };
-
-    // A completed turn whose history loaded a skill mid-turn.
-    function skillLoadLog(
-        turnId: string,
-        sessionId: string,
-        agent: CreateTurnInput["agent"],
-        source = "organize-files",
-    ): TEvent[] {
-        const created = createdEvent(turnId, {
-            agent,
-            sessionId,
-            context: [],
-            input: user("hi"),
-            config: { humanAvailable: true },
-        });
-        return [
-            created,
-            {
-                type: "model_call_requested",
-                turnId,
-                ts: TS,
-                modelCallIndex: 0,
-                request: { messages: ["input"], parameters: {} },
-            },
-            {
-                type: "model_call_completed",
-                turnId,
-                ts: TS,
-                modelCallIndex: 0,
-                message: {
-                    role: "assistant",
-                    content: [
-                        {
-                            type: "tool-call",
-                            toolCallId: "A",
-                            toolName: "loadSkill",
-                            arguments: {},
-                        },
-                    ],
-                },
-                finishReason: "tool-calls",
-                usage: {},
-            },
-            {
-                type: "tool_invocation_requested",
-                turnId,
-                ts: TS,
-                toolCallId: "A",
-                toolId: "builtin:loadSkill",
-                toolName: "loadSkill",
-                execution: "sync",
-                input: {},
-            },
-            {
-                type: "tool_result",
-                turnId,
-                ts: TS,
-                toolCallId: "A",
-                toolName: "loadSkill",
-                source: "sync",
-                result: { output: { success: true }, isError: false },
-            },
-            {
-                type: "tools_extended",
-                turnId,
-                ts: TS,
-                toolCallId: "A",
-                source,
-                tools: [skillTool],
-            },
-            {
-                type: "model_call_requested",
-                turnId,
-                ts: TS,
-                modelCallIndex: 1,
-                request: { messages: ["assistant:0", "toolResult:A"], parameters: {} },
-            },
-            {
-                type: "model_call_completed",
-                turnId,
-                ts: TS,
-                modelCallIndex: 1,
-                message: assistantText("ok"),
-                finishReason: "stop",
-                usage: {},
-            },
-            {
-                type: "turn_completed",
-                turnId,
-                ts: TS,
-                output: assistantText("ok"),
-                finishReason: "stop",
-                usage: {},
-            },
-        ];
-    }
-
     it("the next turn's composition carries skills recorded by tools_extended", async () => {
         const { sessions, fake } = makeSessions();
         const sessionId = await sessions.createSession();
@@ -1233,6 +1254,72 @@ describe("active-skill carry-forward", () => {
     });
 });
 
+describe("space-thread session pins", () => {
+    const origin = {
+        kind: "space_thread" as const,
+        orgId: "org-1",
+        spaceId: "01M07B68G1BQFP70TX5RPHJX89",
+        threadRootId: "01M07ROOTAAAAAAAAAAAAAAAA1",
+        spaceName: "Roadboard",
+    };
+    const pinned = {
+        org: "org-1",
+        spaceName: "Roadboard",
+        spaceId: "01M07B68G1BQFP70TX5RPHJX89",
+        threadRootId: "01M07ROOTAAAAAAAAAAAAAAAA1",
+    };
+
+    it("pins the thread and the spaces skill on the very first turn — no loadSkill round trip", async () => {
+        const { sessions, fake } = makeSessions();
+        const sessionId = await sessions.createSession({ title: "t", origin });
+        await sessions.sendMessage(sessionId, user("@rowboat move SSO to P1"), {
+            agent: { agentId: "copilot" },
+        });
+        expect(fake.createTurnInputs[0].agent).toEqual({
+            agentId: "copilot",
+            overrides: { composition: { spaceThread: pinned, activeSkills: ["spaces"] } },
+        });
+    });
+
+    it("pins every turn, whoever sends into the session, and keeps caller composition", async () => {
+        const { sessions, fake } = makeSessions();
+        const sessionId = await sessions.createSession({ origin });
+        const { turnId } = await sessions.sendMessage(sessionId, user("one"), {
+            agent: { agentId: "copilot" },
+        });
+        await flush();
+        fake.setLog(turnId, turnLog(turnId, sessionId, "completed"));
+        // The person chatting in the thread pane: a plain message, no origin.
+        await sessions.sendMessage(sessionId, user("two"), {
+            agent: { agentId: "copilot", overrides: { composition: { searchEnabled: true } } },
+        });
+        expect(fake.createTurnInputs[1].agent).toMatchObject({
+            overrides: { composition: { searchEnabled: true, spaceThread: pinned, activeSkills: ["spaces"] } },
+        });
+    });
+
+    it("merges the pinned skill with skills the session loaded, carried ones first", async () => {
+        const { sessions, fake } = makeSessions();
+        const sessionId = await sessions.createSession({ origin });
+        const { turnId } = await sessions.sendMessage(sessionId, user("one"), {
+            agent: { agentId: "copilot" },
+        });
+        await flush();
+        fake.setLog(turnId, skillLoadLog(turnId, sessionId, { agentId: "copilot" }));
+        await sessions.sendMessage(sessionId, user("two"), { agent: { agentId: "copilot" } });
+        expect(fake.createTurnInputs[1].agent).toMatchObject({
+            overrides: { composition: { activeSkills: ["organize-files", "spaces"] } },
+        });
+    });
+
+    it("an ordinary session gets no thread pin", async () => {
+        const { sessions, fake } = makeSessions();
+        const sessionId = await sessions.createSession();
+        await sessions.sendMessage(sessionId, user("hi"), { agent: { agentId: "copilot" } });
+        expect(fake.createTurnInputs[0].agent).toEqual({ agentId: "copilot" });
+    });
+});
+
 describe("pending queue (sendOrQueueMessage, steering, promotion)", () => {
     function queueEventsOf(bus: RecordingBus) {
         return bus.events.filter((e) => e.kind === "queue-changed");
@@ -1251,11 +1338,15 @@ describe("pending queue (sendOrQueueMessage, steering, promotion)", () => {
 
     it("queues while the latest turn is non-terminal and mirrors the queue on the bus", async () => {
         const { sessions, fake, bus } = makeSessions();
+        // Hold the advance open: the turn is genuinely live (an idle log with
+        // no live advance would instead be reclaimed as crash-orphaned).
+        fake.script = () => ({
+            pending: new Promise<TurnOutcome>(() => undefined),
+        });
         const sessionId = await sessions.createSession();
-        const { turnId } = await sessions.sendMessage(sessionId, user("one"), {
+        await sessions.sendMessage(sessionId, user("one"), {
             agent: { agentId: "copilot" },
         });
-        void turnId; // default log stays idle (non-terminal)
 
         const result = await sessions.sendOrQueueMessage(sessionId, user("two"), {
             agent: { agentId: "copilot" },
@@ -1272,8 +1363,69 @@ describe("pending queue (sendOrQueueMessage, steering, promotion)", () => {
         });
     });
 
+    it("reclaims a crash-orphaned turn: cancels it and starts the new turn", async () => {
+        const { sessions, fake } = makeSessions();
+        const sessionId = await sessions.createSession();
+        const { turnId } = await sessions.sendMessage(sessionId, user("one"), {
+            agent: { agentId: "copilot" },
+        });
+        // The advance settled without a terminal event ever landing in the
+        // log — exactly what a dead process leaves behind: an idle log and
+        // no live advance.
+        await flush();
+
+        fake.script = ({ turnId: t, input }) => {
+            if (input?.type === "cancel") {
+                fake.setLog(t, [
+                    ...turnLog(t, sessionId, "idle"),
+                    { type: "turn_cancelled", turnId: t, ts: TS, reason: input.reason, usage: {} },
+                ]);
+                return { outcome: { status: "cancelled", usage: {} } };
+            }
+            return { outcome: completedOutcome() };
+        };
+        const result = await sessions.sendOrQueueMessage(sessionId, user("two"), {
+            agent: { agentId: "copilot" },
+        });
+
+        expect(result).toMatchObject({ queued: false });
+        const cancel = fake.advanceCalls.find((c) => c.input?.type === "cancel");
+        expect(cancel).toMatchObject({
+            turnId,
+            input: { type: "cancel", reason: expect.stringContaining("interrupted") },
+        });
+        // The new turn chains onto the cancelled ghost; nothing stays queued.
+        expect(fake.createTurnInputs).toHaveLength(2);
+        expect(fake.createTurnInputs[1]).toMatchObject({
+            input: user("two"),
+            context: { previousTurnId: turnId },
+        });
+        expect(sessions.listQueued(sessionId)).toEqual([]);
+    });
+
+    it("does not reclaim a suspended turn — permission/async-tool waits still queue", async () => {
+        const { sessions, fake } = makeSessions();
+        const sessionId = await sessions.createSession();
+        const { turnId } = await sessions.sendMessage(sessionId, user("one"), {
+            agent: { agentId: "copilot" },
+        });
+        await flush();
+        fake.setLog(turnId, turnLog(turnId, sessionId, "suspended"));
+
+        const result = await sessions.sendOrQueueMessage(sessionId, user("two"), {
+            agent: { agentId: "copilot" },
+        });
+
+        expect(result).toMatchObject({ queued: true });
+        expect(fake.advanceCalls.filter((c) => c.input?.type === "cancel")).toHaveLength(0);
+        expect(fake.createTurnInputs).toHaveLength(1);
+    });
+
     it("hands the pending queue to every session advance as a steer source", async () => {
         const { sessions, fake } = makeSessions();
+        fake.script = () => ({
+            pending: new Promise<TurnOutcome>(() => undefined),
+        });
         const sessionId = await sessions.createSession();
         await sessions.sendMessage(sessionId, user("one"), {
             agent: { agentId: "copilot" },
@@ -1285,10 +1437,74 @@ describe("pending queue (sendOrQueueMessage, steering, promotion)", () => {
         const takeInputs = fake.advanceCalls[0].takeInputs;
         expect(takeInputs).toBeDefined();
         // The loop draining the source consumes the queue.
-        expect(await takeInputs!()).toEqual([user("steer me in")]);
+        expect(await takeInputs!()).toEqual([{ message: user("steer me in") }]);
         expect(sessions.listQueued(sessionId)).toEqual([]);
         // A second drain finds nothing.
         expect(await takeInputs!()).toEqual([]);
+    });
+
+    it("carries the send config's origin onto the queue entry and the steer drain", async () => {
+        const origin = {
+            kind: "space_mention" as const,
+            orgId: "org-1",
+            spaceId: "space-1",
+            threadRootId: "root-1",
+            messageId: "msg-1",
+        };
+        const { sessions, fake } = makeSessions();
+        fake.script = () => ({
+            pending: new Promise<TurnOutcome>(() => {}),
+        });
+        const sessionId = await sessions.createSession();
+        await sessions.sendMessage(sessionId, user("first"), {
+            agent: { agentId: "copilot" },
+        });
+        await sessions.sendOrQueueMessage(sessionId, user("from a thread"), {
+            agent: { agentId: "copilot" },
+            origin,
+        });
+        expect(sessions.listQueued(sessionId)).toMatchObject([{ message: user("from a thread"), origin }]);
+        const takeInputs = fake.advanceCalls[0].takeInputs;
+        expect(await takeInputs!()).toEqual([{ message: user("from a thread"), origin }]);
+    });
+
+    it("stamps the origin on the turn a message starts, immediately or by promotion", async () => {
+        const origin = {
+            kind: "space_mention" as const,
+            orgId: "org-1",
+            spaceId: "space-1",
+            threadRootId: "root-1",
+            messageId: "msg-1",
+        };
+        const { sessions, fake } = makeSessions();
+        const sessionId = await sessions.createSession();
+        // Immediate start: the config's origin is on createTurn's input.
+        let settle!: (outcome: TurnOutcome) => void;
+        fake.script = () => ({
+            pending: new Promise<TurnOutcome>((resolve) => {
+                settle = resolve;
+            }),
+        });
+        const { turnId } = await sessions.sendMessage(sessionId, user("first"), {
+            agent: { agentId: "copilot" },
+            origin,
+        });
+        expect(fake.createTurnInputs[0]).toMatchObject({ origin });
+        // Promotion: the queued entry's own origin, not the live turn's.
+        await sessions.sendOrQueueMessage(sessionId, user("after you finish"), {
+            agent: { agentId: "copilot" },
+            origin: { ...origin, messageId: "msg-2" },
+        });
+        fake.script = undefined;
+        fake.setLog(turnId, turnLog(turnId, sessionId, "completed"));
+        settle(completedOutcome());
+        await flush();
+        await flush();
+        expect(fake.createTurnInputs).toHaveLength(2);
+        expect(fake.createTurnInputs[1]).toMatchObject({
+            input: user("after you finish"),
+            origin: { ...origin, messageId: "msg-2" },
+        });
     });
 
     it("promotes the pending head into a new turn when the running turn settles", async () => {
@@ -1445,5 +1661,47 @@ describe("pending queue (sendOrQueueMessage, steering, promotion)", () => {
         });
         await sessions.deleteSession(sessionId);
         expect(sessions.listQueued(sessionId)).toEqual([]);
+    });
+});
+
+describe('before first session message', () => {
+    it('awaits the start hook before a turn is created', async () => {
+        let release!: () => void;
+        let entered!: () => void;
+        const ready = new Promise<void>((resolve) => { entered = resolve; });
+        const { sessions } = makeSessions({ beforeSessionStart: async () => {
+            entered();
+            await new Promise<void>((resolve) => { release = resolve; });
+        } });
+        const id = await sessions.createSession();
+        const send = sessions.sendMessage(id, user('start'), { agent: { agentId: 'copilot' } });
+        await ready;
+        expect((await sessions.getSession(id)).turns).toHaveLength(0);
+        release();
+        await send;
+        expect((await sessions.getSession(id)).turns).toHaveLength(1);
+    });
+    it('does not start a turn if the durable start hook fails', async () => {
+        const { sessions } = makeSessions({ beforeSessionStart: async () => { throw new Error('Cannot persist start'); } });
+        const id = await sessions.createSession();
+        await expect(sessions.sendOrQueueMessage(id, user('start'), { agent: { agentId: 'copilot' } })).rejects.toThrow('Cannot persist start');
+        expect((await sessions.getSession(id)).turns).toHaveLength(0);
+    });
+});
+
+
+describe('project Code preference', () => {
+    it.each([false, true, undefined])('honors persisted Code=%s over stale caller settings without losing cwd', async (enabled) => {
+        const { sessions, fake } = makeSessions({ sessionCompositionPins: async () => projectSessionComposition({
+            id: 'project-session', projectId: 'p', title: 'Project', agent: 'codex', cwd: '/project/.rowboat/worktrees/thread',
+            codeModeEnabled: enabled, createdAt: TS,
+        }) });
+        const sessionId = await sessions.createSession({});
+        await sessions.sendMessage(sessionId, user('continue'), {
+            agent: { agentId: 'copilot', overrides: { composition: { codeMode: 'claude', codeCwd: '/stale/path', searchEnabled: true } } },
+        });
+        expect(fake.createTurnInputs[0].agent).toMatchObject({ overrides: { composition: {
+            codeMode: enabled === false ? null : 'codex', codeCwd: '/project/.rowboat/worktrees/thread', searchEnabled: true,
+        } } });
     });
 });

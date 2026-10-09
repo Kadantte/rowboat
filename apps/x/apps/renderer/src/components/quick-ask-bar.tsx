@@ -7,7 +7,7 @@ import {
   ChevronsDown,
   Anchor,
   ChevronsUp,
-  ChevronUp,
+  Loader,
   Maximize2,
   MessageCircle,
   Mic,
@@ -23,7 +23,7 @@ import {
   VolumeX,
   X,
 } from 'lucide-react'
-import { Streamdown } from 'streamdown'
+import { Streamdown } from '@/components/streamdown'
 // The raw sonner Toaster, NOT the app's ui/sonner wrapper: the wrapper
 // calls useTheme(), which throws outside ThemeProvider — and this window
 // deliberately has no ThemeProvider. A render crash here paints the whole
@@ -41,10 +41,12 @@ import {
 import { COMMAND_CENTER_CHAT_SENTINEL } from '@x/shared/src/home-threads.js'
 import { reduceTurn } from '@x/shared/src/turns.js'
 import * as quickAskShortcut from '@x/shared/src/quick-ask-shortcut.js'
+import * as pttKey from '@x/shared/src/ptt-key.js'
 import { useQuickAskShortcut } from '@/hooks/use-quick-ask-shortcut'
+import { useWindowTheme } from '@/hooks/use-window-theme'
 
-import { TalkingHead } from '@/components/talking-head'
-import { useVoiceMode } from '@/hooks/useVoiceMode'
+import { MascotFaceIcon, TalkingHead } from '@/components/talking-head'
+import { isMac } from '@/lib/shortcut'
 import { isChatMessage } from '@/lib/chat-conversation'
 import { runLogToConversation } from '@/lib/run-to-conversation'
 import { buildTurnConversation, stripVoiceTags } from '@/lib/session-chat/turn-view'
@@ -55,15 +57,17 @@ import {
   type PermissionMode,
   type StagedAttachment,
 } from '@/components/chat-input-with-mentions'
-import type { FileMention, PromptInputMessage } from '@/components/ai-elements/prompt-input'
+import type { Mention, PromptInputMessage } from '@/components/ai-elements/prompt-input'
 
-// Hold-to-speak key by platform. macOS: right ⌘. Windows: the same physical
-// position is the right Win key, which the OS owns (a tap opens the Start
-// menu) — right Ctrl is the safe equivalent there.
-const IS_MAC = navigator.platform.startsWith('Mac')
-const PTT_CODE = IS_MAC ? 'MetaRight' : 'ControlRight'
+// Hold-to-speak key by platform (shared/ptt-key.ts is the one place that
+// decides): macOS right ⌘, elsewhere right Ctrl — the same physical position
+// on a PC is the right Win key, which the OS owns (a tap opens the Start
+// menu). The LABELS come from there too: this window used to bind Ctrl and
+// still say ⌘, which is the worst of both.
+const PTT_CODE = pttKey.pttEventCode(isMac)
+const PTT_LABEL = pttKey.pttKeyLabel(isMac)
 
-type CompanionMode = 'hidden' | 'summoned' | 'pinned'
+type CompanionMode = 'hidden' | 'pinned'
 
 // Call state mirrored from the app window (the old #video-popout contract).
 type CallState = {
@@ -78,7 +82,7 @@ type CallState = {
   /** Tool-name-level "what's happening" while a turn runs, else null. */
   activityText: string | null
   interimText: string | null
-  /** A quick ⌘ tap locked hands-free capture (until the next tap). */
+  /** A quick talk-key tap locked hands-free capture (until the next tap). */
   pttLocked: boolean
   /** Latest assistant reply of this call (streams while generating). */
   responseText: string | null
@@ -108,47 +112,66 @@ type PopoutAction =
   | 'stop-speaking'
   | 'ptt-down'
   | 'ptt-up'
+  | 'ptt-cancel'
   | 'end-call'
   | 'expand'
 
-// Pill window heights the renderer asks main for (design px, clamped by
-// main): the base pill, and with the response panel expanded.
-const PINNED_BASE_HEIGHT = 320
-const PINNED_RESPONSE_HEIGHT = 560
+// The card's chip recipe, in both skins: a translucent tint of the OPPOSITE
+// ink over a translucent card. Tokens can't say that — `bg-accent` is a flat
+// colour, and flattening these would cost the card the frosted look it is
+// built on — so the pairs are spelled out, once, here.
+//
+// Surface and resting ink are separate because the labelled destination chip
+// rests a shade darker than the icon-only buttons beside it. Only that
+// resting shade differs, so the hover and dark inks stay with the surface.
+// The ring WIDTH (`ring-1 ring-inset`) stays at each call site — those
+// controls differ in shape, not in colour.
+const CHIP_SURFACE =
+  'active:scale-95 bg-black/[0.04] ring-black/10 hover:bg-black/[0.08] hover:text-neutral-900' +
+  ' dark:bg-white/[0.06] dark:ring-white/10 dark:hover:bg-white/[0.12] dark:hover:text-neutral-100'
+const CHIP_INK = 'text-neutral-500 dark:text-neutral-400'
+const CHIP_INK_LABELLED = 'text-neutral-600 dark:text-neutral-400'
+const CHIP_IDLE = `${CHIP_SURFACE} ${CHIP_INK}`
+const CHIP_ACTIVE =
+  'active:scale-95 bg-black/[0.08] text-neutral-900 ring-black/15' +
+  ' dark:bg-white/[0.12] dark:text-neutral-100 dark:ring-white/20'
+const CHIP_DISABLED =
+  'cursor-default bg-black/[0.04] text-neutral-300 ring-black/5' +
+  ' dark:bg-white/[0.04] dark:text-neutral-600 dark:ring-white/5'
 
 /**
- * Content of the quick-ask window (global ⌥⇧Space — see main's quick-ask.ts).
- * The REAL chat composer (ChatInputWithMentions) in a floating card over
- * whatever the user is doing: type a question with @-mentions, attachments,
- * model picker and all — or hold Right ⌘ to speak it — and it lands in the
- * current chat in the app window; the answer streams back here over
- * `quick-ask:state`. The window is hidden, not destroyed, on dismiss — state
- * survives toggles.
+ * Content of the companion window (global ⌥⇧Space — see main's quick-ask.ts).
+ * ONE surface: the SKIPPER — a self-contained composer card hosting a live
+ * voice session: the top strip (logo · destination · window actions · share
+ * · talk/stop · a small ✕ dismiss) over the real composer, which flips to
+ * the app composer's recording bar (live waveform + interim transcript)
+ * while the mic gate is open. Two presentations of that one surface, both
+ * driven by main over `quick-ask:mode`: card open, or tucked down to the
+ * mini call pill (logo · status lane · share · talk/stop · end); a live
+ * CAMERA swaps the card for the self-view pill instead. The window is
+ * hidden, not destroyed, when the session ends.
  *
- * Geometry: the window is a fixed tall transparent frame (main never resizes
- * it). The card is bottom-anchored; the transparent zone above is where the
- * composer's popovers (mentions, model picker, menus) open upward, and a
- * click there dismisses the bar — preserving the click-away feel.
+ * (The old `summoned` role — a standalone Spotlight-style ask bar with its
+ * own answer panel, dictation, and voice/share toggles — is GONE. It existed
+ * only as a fallback surface, and every glitch report about hover mode was
+ * really that bar appearing where the Skipper belonged. The MASCOT is gone
+ * from this surface too — it lives on in the camera pill — replaced by the
+ * strip, panel and composer, which carry the same signals in the card:
+ * waveform = mic gate open, shimmering activity = thinking, glow = working.)
+ *
+ * Geometry: a fixed transparent frame with the card bottom-anchored. The
+ * transparent zone above is where the composer's popovers (mentions, model
+ * picker, menus) open upward; clicking it near the card tucks the text away.
  */
 export function QuickAskBar() {
-  // The global summon chord (customizable) — drives hold-to-talk release
-  // detection, so it must track rebinds live.
-  const shortcut = useQuickAskShortcut()
-  const [asked, setAsked] = useState<string | null>(null)
-  const [answer, setAnswer] = useState<{ processing: boolean; text: string; statusText: string | null } | null>(null)
-  // Only answer pushes that follow OUR submit render — the app window's chat
-  // may show unrelated turns from before the bar was opened.
-  const awaitingRef = useRef(false)
-
-  // Transparent window: clear every layer so only the card paints. The bar
-  // window skips the app's ThemeProvider — claim the LIGHT tokens explicitly
-  // (the light-skin redesign, #810). Removing 'dark' matters: the
-  // pre-light-redesign code added it, and the window persists across HMR, so
-  // a stale 'dark' class left code blocks rendering dark-theme tokens on the
-  // light panel.
+  // This window skips the app's ThemeProvider (main.tsx renders it on a hash
+  // route, outside the tree), so it resolves the shared setting itself and
+  // owns the light/dark class on <html>. It used to hard-force 'light' for
+  // the light-skin redesign (#810) — which meant the theme toggle could never
+  // reach the companion at all.
+  useWindowTheme()
+  // Transparent window: clear every layer so only the card paints.
   useEffect(() => {
-    document.documentElement.classList.remove('dark')
-    document.documentElement.classList.add('light')
     document.documentElement.style.background = 'transparent'
     document.body.style.background = 'transparent'
     // The document must never scroll — a wheel event could shove the whole
@@ -159,7 +182,7 @@ export function QuickAskBar() {
     if (root) root.style.background = 'transparent'
   }, [])
 
-  // Focus the composer whenever the window is summoned.
+  // Focus the composer whenever the window is (re)focused.
   const [focusSignal, setFocusSignal] = useState(1)
   useEffect(() => {
     const onFocus = () => setFocusSignal((n) => n + 1)
@@ -167,38 +190,52 @@ export function QuickAskBar() {
     return () => window.removeEventListener('focus', onFocus)
   }, [])
 
-  // Which role the window is playing: summoned Spotlight bar or pinned call
-  // pill (the old #video-popout, folded into this window). Pushed by main on
-  // every transition; fetched once to cover the load race. 'hidden' renders
-  // as summoned — the window is invisible then anyway.
-  const [mode, setMode] = useState<CompanionMode>('summoned')
-  // Pinned presentation: expanded vs tucked down to just the mascot, and
-  // WHICH surface expanded means — untuck returns you to the surface you
-  // tucked from ('card' for bar-originated voice calls, 'pill' for calls
-  // with live pixels). Main owns both (it resizes the window); pushes keep
-  // us in sync.
-  const [collapsed, setCollapsed] = useState(false)
-  const [surface, setSurface] = useState<'card' | 'pill'>('pill')
+  // The window's role, pushed by main on every transition and fetched once
+  // to cover the load race. There is exactly ONE visible role — `pinned`,
+  // the hover companion — plus `hidden`. UNKNOWN until the first push/fetch
+  // lands, and nothing paints before then.
+  const [role, setRole] = useState<{ seq: number; mode: CompanionMode; collapsed: boolean; surface: 'card' | 'pill' } | null>(null)
   useEffect(() => {
-    const cleanup = window.ipc.on('quick-ask:mode', (m) => {
-      setMode(m.mode === 'hidden' ? 'summoned' : m.mode)
-      setCollapsed(m.collapsed)
-      setSurface(m.surface)
-    })
-    void window.ipc
-      .invoke('quickAsk:getMode', null)
-      .then((m) => {
-        setMode(m.mode === 'hidden' ? 'summoned' : m.mode)
-        setCollapsed(m.collapsed)
-        setSurface(m.surface)
-      })
-      .catch(() => {})
+    const apply = (m: { seq: number; mode: CompanionMode; collapsed: boolean; surface: 'card' | 'pill' }) => {
+      // Pushes and the fetch can interleave — the highest seq is the truth.
+      setRole((prev) => (prev && prev.seq > m.seq ? prev : m))
+    }
+    const cleanup = window.ipc.on('quick-ask:mode', apply)
+    void window.ipc.invoke('quickAsk:getMode', null).then(apply).catch(() => {})
     return cleanup
   }, [])
-  const pinned = mode === 'pinned'
-  // The bar-style card hosting a LIVE voice call ("bring the text back"
-  // from a bar-originated tuck): same layout, call-aware contents.
+  // Paint ack: once the pushed role is on screen, tell main — it reveals
+  // (or resizes) the window only then, never mid-transition. Two frames in:
+  // the first rAF runs before this commit is painted, the second after it
+  // has been.
+  const roleSeq = role?.seq ?? 0
+  useEffect(() => {
+    if (!roleSeq) return
+    let cancelled = false
+    const raf1 = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (cancelled) return
+        void window.ipc.invoke('quickAsk:modeApplied', { seq: roleSeq }).catch(() => {})
+      })
+    })
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(raf1)
+    }
+  }, [roleSeq])
+  const pinned = role?.mode === 'pinned'
+  // Presentation: expanded vs tucked down to just the mascot, and WHICH
+  // surface expanded means — the Skipper card, or the pill when a live
+  // camera needs its self-view. Main owns both (it resizes the window);
+  // pushes keep us in sync.
+  const collapsed = role?.collapsed ?? false
+  const surface = role?.surface ?? 'card'
+  // The Skipper's text panel is open (mascot + card, the default landing).
   const callCard = pinned && !collapsed && surface === 'card'
+  // The frame is mostly transparent stage — hand the clicks that land on it
+  // back to whatever the user has underneath.
+  useClickThrough(pinned)
+  useDragCursor()
 
   // Mirrors callState.speakerMuted for the fold callback below (which is
   // deliberately dependency-free).
@@ -219,11 +256,20 @@ export function QuickAskBar() {
     void window.ipc.invoke('quickAsk:setPinnedCollapsed', { collapsed: next }).catch(() => {})
   }, [])
 
+  // The card's fold is animated, so it outlives `collapsed` by the length of
+  // its exit (usePresence) — everything below keys off `card.mounted`, not
+  // `!collapsed`.
+  const card = usePresence(!collapsed, CARD_EXIT_MS)
+
   // The visible card, for hit-testing stage clicks: the window is a tall
   // transparent frame, so "clicked outside" often lands INSIDE its invisible
   // stage. Tuck-on-stage-click only counts near the card — clicks in
   // visually-empty space must not steal the panel.
   const cardRef = useRef<HTMLDivElement | null>(null)
+  // Reached only where the window is still SOLID, i.e. the grace ring just
+  // outside the card (useClickThrough) — further out the click belongs to
+  // whatever is behind us. The band stays generous so the gesture never
+  // depends on the ring's exact width.
   const TUCK_BAND_PX = 80
   const stageTuck = useCallback((e: React.MouseEvent) => {
     const card = cardRef.current?.getBoundingClientRect()
@@ -244,6 +290,15 @@ export function QuickAskBar() {
   // this window only renders it (same contract as the old popout).
   const [callState, setCallState] = useState<CallState>(IDLE_CALL_STATE)
   speakerMutedRef.current = callState.speakerMuted
+  // Leaving the pinned role ends this window's view of the call: drop the
+  // mirror so a later summon never paints the previous call's status or
+  // reply for a frame (main replays the live state on every pin). Render-
+  // time previous-state adjustment (React's no-effect pattern).
+  const [prevPinned, setPrevPinned] = useState(pinned)
+  if (prevPinned !== pinned) {
+    setPrevPinned(pinned)
+    if (!pinned) setCallState(IDLE_CALL_STATE)
+  }
   // Flicker-held activity label shared by every surface this window renders
   // (Skipper chip + panel, tucked chip, pill chip).
   const heldActivity = useHeldLabel(callState.activityText)
@@ -261,21 +316,36 @@ export function QuickAskBar() {
   }, [])
 
   // Relay a call control action to the app window (mic/camera/capture live
-  // there; the pill is a dumb terminal).
+  // there; this window is a dumb terminal).
   const sendAction = useCallback((action: PopoutAction) => {
     void window.ipc.invoke('video:popoutAction', { action }).catch(() => {})
   }, [])
 
-  // The summoned mascot has no audio pipeline — its mouth stays closed; the
-  // thinking bubbles (driven by ttsState) are its only active state here.
-  // During a call-card session the mascot lip-syncs off a synthesized level
-  // instead (the real audio plays in the app window).
-  const zeroLevel = useCallback(() => 0, [])
-  const synthLevel = useCallback(() => 0.45 + 0.35 * Math.sin(performance.now() / 90), [])
+  // The mic gate is open — the composer flips to its recording bar.
+  const micOpen = !callState.micMuted && (callState.status === 'listening' || callState.pttLocked)
+
+  // Levels feeding the composer's recording waveform — the REAL per-frame
+  // amplitudes from the app window's voice hook (one auto-gained level per
+  // captured audio frame, ~16/s), relayed over video:popout-levels: the
+  // bars move at the app composer's cadence and track actual speech.
+  // (Audio itself can't cross windows; a few numbers a second can — this
+  // replaced a synthesized envelope that neither tracked the voice nor
+  // matched the pace.) Cleared when the gate closes, so the next capture
+  // starts a fresh strip.
+  const levelsRef = useRef<number[]>([])
+  useEffect(() => {
+    return window.ipc.on('video:popout-levels', ({ levels }) => {
+      const arr = levelsRef.current
+      arr.push(...levels)
+      if (arr.length > 4800) arr.splice(0, arr.length - 4800)
+    })
+  }, [])
+  useEffect(() => {
+    if (!micOpen) levelsRef.current = []
+  }, [micOpen])
 
   // Knowledge files for @-mentions, fetched over IPC (this window has no
-  // App-owned tree). Refreshed on every summon — notes change while the bar
-  // is hidden.
+  // App-owned tree). Refreshed on focus — notes change while it's hidden.
   const [knowledgeFiles, setKnowledgeFiles] = useState<string[]>([])
   useEffect(() => {
     const refresh = () => {
@@ -297,25 +367,19 @@ export function QuickAskBar() {
     return () => window.removeEventListener('focus', refresh)
   }, [])
 
-  useEffect(() => {
-    return window.ipc.on('quick-ask:state', (s) => {
-      if (!awaitingRef.current) return
-      setAnswer({ processing: s.processing, text: s.responseText ?? '', statusText: s.statusText ?? null })
-    })
-  }, [])
-
-  // The bar composer's ModelSelection (model + effort, one value — main's
+  // The composer's ModelSelection (model + effort, one value — main's
   // unified shape) rides along with each submit; the app window applies it
-  // to the active chat before submitting. Hover asks default to FAST
-  // thinking at the submit boundary when the selection carries no effort.
+  // to the companion's session before submitting.
   const selectionRef = useRef<ModelSelection | null>(null)
 
-  const processing = answer?.processing ?? false
-
+  // Typed input during a session: the FULL composer payload relays to the
+  // app window, which submits it into the companion's chat exactly like an
+  // in-app message. The reply comes back through the call mirror
+  // (`video:popout-state`), same as a spoken one.
   const submit = useCallback(
     (
       message: PromptInputMessage,
-      mentions?: FileMention[],
+      mentions?: Mention[],
       attachments?: StagedAttachment[],
       searchEnabled?: boolean,
       codeMode?: 'claude' | 'codex',
@@ -323,9 +387,6 @@ export function QuickAskBar() {
     ) => {
       const text = message.text.trim()
       if (!text && !attachments?.length) return
-      setAsked(text || (attachments ?? []).map((a) => a.filename).join(', '))
-      awaitingRef.current = true
-      setAnswer({ processing: true, text: '', statusText: 'Thinking…' })
       void window.ipc
         .invoke('quickAsk:submit', {
           text,
@@ -344,22 +405,11 @@ export function QuickAskBar() {
     [],
   )
 
-  const stop = useCallback(() => {
-    void window.ipc.invoke('quickAsk:stop', null).catch(() => {})
-  }, [])
-
   // History peek — display is EXPLICIT (the no-history default is right for
-  // ~90% of asks), but the DATA is prefetched eagerly on summon/switch so
-  // the click is instant: a local IPC read of a few KB, no downside.
+  // ~90% of asks), but the DATA is prefetched eagerly on switch so the click
+  // is instant: a local IPC read of a few KB, no downside.
   const [historyData, setHistoryData] = useState<{ role: 'user' | 'assistant'; content: string }[] | null>(null)
   const [showHistory, setShowHistory] = useState(false)
-
-  const reset = useCallback(() => {
-    awaitingRef.current = false
-    setAsked(null)
-    setAnswer(null)
-    setShowHistory(false)
-  }, [])
 
   // Destination-chat context: which chat submits land in (title chip) plus
   // recents for the chip's switcher. Pushed by the app window; cached in
@@ -372,14 +422,9 @@ export function QuickAskBar() {
   useEffect(() => {
     return window.ipc.on('quick-ask:chat-context', (ctx) => setChatContext(ctx))
   }, [])
-  const selectChat = useCallback(
-    (rid: string) => {
-      // The panel's exchange belongs to the previous chat — clear it.
-      reset()
-      void window.ipc.invoke('quickAsk:selectChat', { runId: rid }).catch(() => {})
-    },
-    [reset],
-  )
+  const selectChat = useCallback((rid: string) => {
+    void window.ipc.invoke('quickAsk:selectChat', { runId: rid }).catch(() => {})
+  }, [])
 
   // A destination change from ANY side (chip, app tab switch, new chat)
   // invalidates a shown history — it belonged to the previous chat.
@@ -425,7 +470,7 @@ export function QuickAskBar() {
     }
   }, [])
 
-  // Prefetch on summon/switch so the peek opens instantly.
+  // Prefetch on switch so the peek opens instantly.
   useEffect(() => {
     if (!activeRunId) return
     let stale = false
@@ -454,249 +499,48 @@ export function QuickAskBar() {
     if (!activeRunId) return
     setShowHistory(true)
     // Show the prefetched copy immediately, refresh behind it — exchanges
-    // made since the prefetch (including from this bar) must show up.
+    // made since the prefetch (including from here) must show up.
     void fetchHistory(activeRunId).then((items) => setHistoryData(items))
   }, [showHistory, activeRunId, fetchHistory])
 
-  // Voice input: the composer's mic button, or hold the platform PTT key
-  // (right ⌘ on macOS, right Ctrl on Windows) while the bar is focused.
-  // Local dictation via the same Deepgram flow as the app composer — no
-  // global hook needed, the bar has keyboard focus by construction.
-  const voice = useVoiceMode()
-  const [recording, setRecording] = useState(false)
-  const recordingRef = useRef(false)
-  const [voiceAvailable, setVoiceAvailable] = useState(false)
-  const [ttsAvailable, setTtsAvailable] = useState(false)
-  useEffect(() => {
-    Promise.all([
-      window.ipc.invoke('voice:getConfig', null),
-      window.ipc.invoke('oauth:getState', null),
-    ])
-      .then(([config, oauthState]) => {
-        const rowboatConnected = oauthState.config?.rowboat?.connected ?? false
-        setVoiceAvailable(!!config.deepgram || rowboatConnected)
-        setTtsAvailable(!!config.elevenlabs || rowboatConnected)
-      })
-      .catch(() => {
-        setVoiceAvailable(false)
-        setTtsAvailable(false)
-      })
-  }, [])
-  // Tucking starts a voice call — same gate as the call button.
-  const callAvailable = voiceAvailable && ttsAvailable
-
-  const tuck = useCallback(() => {
-    void window.ipc.invoke('quickAsk:tuck', null).catch(() => {})
-  }, [])
-
-  const startRecording = useCallback(() => {
-    if (recordingRef.current) return
-    recordingRef.current = true
-    setRecording(true)
-    void voice.start().then((result) => {
-      if (result === 'mic-denied') {
-        recordingRef.current = false
-        setRecording(false)
-        void window.ipc.invoke('app:openPrivacySettings', { section: 'microphone' }).catch(() => {})
-      }
-    })
-  }, [voice])
-
-  const submitRecording = useCallback(async () => {
-    if (!recordingRef.current) return
-    recordingRef.current = false
-    setRecording(false)
-    const text = await voice.submit()
-    if (text) submit({ text, files: [] })
-  }, [voice, submit])
-
-  const cancelRecording = useCallback(() => {
-    voice.cancel()
-    recordingRef.current = false
-    setRecording(false)
-  }, [voice])
-
-  // Hold-chord-to-talk (the Wispr gesture, default ⌥⇧Space — the chord is
-  // customizable in Settings → Shortcuts): a chord summon starts
-  // capturing IMMEDIATELY — one gesture from anywhere to a spoken question.
-  // Electron's global shortcut can't see the key-UP, so the release is
-  // detected here once the window has focus: any chord key's keyup, or any
-  // event whose modifier state shows the chord's modifiers are no
-  // longer held, finalizes and submits. A quick TAP falls out for free —
-  // nothing was said, the transcript comes back empty, and an empty
-  // transcript doesn't submit, leaving the composer focused for typing.
-  // Typing, Esc, or blur cancels; a hard cap ends a stuck session.
-  const chordRef = useRef(false)
-  const capStartedAtRef = useRef<number | null>(null)
-  const voiceAvailableRef = useRef(false)
-  useEffect(() => {
-    voiceAvailableRef.current = voiceAvailable
-  }, [voiceAvailable])
-  const endChord = useCallback(
-    (how: 'submit' | 'cancel') => {
-      if (!chordRef.current) return
-      chordRef.current = false
-      if (how === 'submit') void submitRecording()
-      else cancelRecording()
-    },
-    [submitRecording, cancelRecording],
-  )
-  useEffect(() => {
-    return window.ipc.on('quick-ask:summoned', ({ viaShortcut }) => {
-      if (!viaShortcut || pinned || recordingRef.current || !voiceAvailableRef.current) return
-      chordRef.current = true
-      startRecording()
-    })
-  }, [pinned, startRecording])
-  useEffect(() => {
-    const chordCodes = quickAskShortcut.shortcutChordCodes(shortcut.accelerator)
-    const chordModifiers = quickAskShortcut.shortcutModifierStates(shortcut.accelerator)
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (chordRef.current && chordCodes.includes(e.code)) endChord('submit')
-    }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (!chordRef.current) return
-      if (e.key === 'Escape') {
-        endChord('cancel')
-        return
-      }
-      // A non-chord key means they're typing — get out of the way.
-      if (!chordCodes.includes(e.code)) endChord('cancel')
-    }
-    const onMouseMove = (e: MouseEvent) => {
-      // Backup release signal: the chord's modifiers are no longer held
-      // (its keyups were delivered before this window took focus).
-      if (chordRef.current && chordModifiers.every((m) => !e.getModifierState(m))) {
-        endChord('submit')
-      }
-    }
-    const onBlur = () => endChord('cancel')
-    document.addEventListener('keyup', onKeyUp)
-    document.addEventListener('keydown', onKeyDown)
-    document.addEventListener('mousemove', onMouseMove)
-    window.addEventListener('blur', onBlur)
-    const cap = setInterval(() => {
-      // Stuck-session cap: no release signal for 45s means we missed it.
-      if (chordRef.current && capStartedAtRef.current && Date.now() - capStartedAtRef.current > 45_000) {
-        endChord('submit')
-      }
-    }, 5_000)
-    return () => {
-      document.removeEventListener('keyup', onKeyUp)
-      document.removeEventListener('keydown', onKeyDown)
-      document.removeEventListener('mousemove', onMouseMove)
-      window.removeEventListener('blur', onBlur)
-      clearInterval(cap)
-    }
-  }, [endChord, shortcut.accelerator])
-  useEffect(() => {
-    capStartedAtRef.current = recording ? Date.now() : null
-  }, [recording])
-
-  // Optional toggles. voiceOut: answers to bar questions are spoken aloud.
-  // sharing: the app window's screen capture runs and frames ride along with
-  // bar submits — the ACTUAL state comes back over quick-ask:options-state
-  // (a denied permission must never leave a lying badge).
-  const [voiceOut, setVoiceOut] = useState(false)
-  const [sharing, setSharing] = useState(false)
-  const pushOptions = useCallback((voiceOutput: boolean, screenShare: boolean) => {
-    void window.ipc.invoke('quickAsk:setOptions', { voiceOutput, screenShare }).catch(() => {})
-  }, [])
-  useEffect(() => {
-    return window.ipc.on('quick-ask:options-state', (s) => {
-      setSharing(s.screenSharing)
-      setVoiceOut(s.voiceOutput)
-    })
-  }, [])
-  const toggleVoiceOut = useCallback(() => {
-    const next = !voiceOut
-    setVoiceOut(next)
-    pushOptions(next, sharing)
-  }, [voiceOut, sharing, pushOptions])
-  const toggleShare = useCallback(() => {
-    const next = !sharing
-    setSharing(next)
-    pushOptions(voiceOut, next)
-  }, [voiceOut, sharing, pushOptions])
-  // The bar owns the share's consent surface — when it goes away (blur,
-  // Esc, jump to the app), the share it started must stop with it. Nothing
-  // may keep capturing the screen with no indicator in sight.
-  const stopShareIfOn = useCallback(() => {
-    if (!sharing) return
-    setSharing(false)
-    pushOptions(voiceOut, false)
-  }, [sharing, voiceOut, pushOptions])
-  useEffect(() => {
-    const onBlur = () => stopShareIfOn()
-    window.addEventListener('blur', onBlur)
-    return () => window.removeEventListener('blur', onBlur)
-  }, [stopShareIfOn])
-
-  const dismiss = useCallback(() => {
-    stopShareIfOn()
-    void window.ipc.invoke('quickAsk:hide', null).catch(() => {})
-  }, [stopShareIfOn])
-
-  // Jump to the full conversation: the question already lives in the app's
-  // active chat (the bar relays into it), so focusing the app window lands
-  // on this exact exchange. The bar gets out of the way.
-  const openInApp = useCallback(() => {
-    stopShareIfOn()
-    void window.ipc.invoke('quickAsk:openChat', null).catch(() => {})
-    void window.ipc.invoke('quickAsk:hide', null).catch(() => {})
-  }, [stopShareIfOn])
-
-  // Fresh conversation for the next question: resets the app's active chat
-  // (in the background) and clears the panel. The bar stays up.
+  // Fresh conversation for the next question: rebinds the companion's chat
+  // (in the app window). The session keeps going.
   const newChat = useCallback(() => {
     void window.ipc.invoke('quickAsk:newChat', null).catch(() => {})
-    reset()
-  }, [reset])
+  }, [])
 
-  // Hold the platform PTT key to speak. Outside a call: local dictation,
-  // release submits the transcript. During a call (pinned): the app's PTT
-  // machine owns the mic — relay the key edges to it instead (this works
-  // even without the Input Monitoring grant, since the pill has focus).
-  // Esc: cancel recording → clear the answer → dismiss, in that order —
-  // but never dismiss a live call surface.
+  // Jump to the full conversation in the app's side pane. The session keeps
+  // going — this window stays exactly as it is.
+  const openInApp = useCallback(() => {
+    void window.ipc.invoke('quickAsk:openChat', null).catch(() => {})
+  }, [])
+
+  // Hold the platform PTT key to speak: the app's PTT machine owns the mic,
+  // so relay the key edges to it (this works even without the Input
+  // Monitoring grant, since this window has focus). While the mic gate is
+  // open, Enter sends and Escape discards — the same keys the app
+  // composer's dictation binds — and only otherwise does Esc tuck the text
+  // (it never ends a session).
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === PTT_CODE && !e.repeat) {
-        if (pinned) {
-          sendAction('ptt-down')
-        } else if (!recordingRef.current) {
-          startRecording()
-        }
-      } else if (e.key === 'Escape') {
-        if (pinned) {
-          // Esc never ends a call — on the call card it tucks the text
-          // back into the mascot; on the pill it does nothing.
-          if (surface === 'card' && !collapsed) {
-            e.preventDefault()
-            requestCollapsed(true)
-          }
-          return
-        }
+        sendAction('ptt-down')
+      } else if (micOpen && e.key === 'Enter') {
         e.preventDefault()
-        if (recordingRef.current) {
-          cancelRecording()
-        } else if (asked) {
-          reset()
-        } else {
-          dismiss()
-        }
+        sendAction('ptt-up')
+      } else if (micOpen && e.key === 'Escape') {
+        e.preventDefault()
+        sendAction('ptt-cancel')
+      } else if (e.key === 'Escape' && callCard) {
+        e.preventDefault()
+        requestCollapsed(true)
       }
     }
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.code !== PTT_CODE) return
-      if (pinned) {
-        sendAction('ptt-up')
-      } else if (recordingRef.current) {
-        void submitRecording()
-      }
+      if (e.code === PTT_CODE) sendAction('ptt-up')
     }
-    // Capture phase: right ⌘ must work even while the embedded composer (or
-    // any popover) has focus — "press ⌘ and speak" is promised in BOTH
+    // Capture phase: the talk key must work even while the embedded composer
+    // (or any popover) has focus — "press and speak" is promised in BOTH
     // Skipper states, and bubble-phase listeners can be swallowed below.
     document.addEventListener('keydown', onKeyDown, true)
     document.addEventListener('keyup', onKeyUp, true)
@@ -704,27 +548,64 @@ export function QuickAskBar() {
       document.removeEventListener('keydown', onKeyDown, true)
       document.removeEventListener('keyup', onKeyUp, true)
     }
-  }, [asked, pinned, surface, collapsed, requestCollapsed, sendAction, startRecording, submitRecording, cancelRecording, reset, dismiss])
+  }, [callCard, micOpen, requestCollapsed, sendAction])
 
-  // Pinned PILL role, tucked: just the mascot (voice-to-voice). The card
-  // surface does NOT branch here — its folded state renders inside the one
-  // Skipper layout below, so the mascot never remounts (and never moves) on
-  // fold/unfold.
-  if (pinned && collapsed && surface !== 'card') {
+  // --- Derived values for the card layout. Computed BEFORE the early
+  // returns below: the useMemo is a hook, and a hook after a conditional
+  // return changes the hook count between renders (React throws "rendered
+  // more/fewer hooks" and unmounts the whole window — the old pill ⇄ card
+  // crash on camera toggles).
+  const panelAsked = callState.questionText
+  const panelText = callState.responseText ?? ''
+  const panelProcessing = callState.status === 'thinking'
+  const panelStatusText = heldActivity ?? 'Thinking…'
+
+  // History includes the chat's LATEST messages — but the current exchange
+  // is already rendered below the "earlier" divider, so trim it off the
+  // tail. Matched on the question text (the reliable key: a streaming reply
+  // can differ from its stored copy): drop the newest user message and
+  // everything after it iff it IS the question on display.
+  const earlierItems = useMemo(() => {
+    if (!historyData) return historyData
+    const current = (panelAsked ?? '').trim()
+    if (!current) return historyData
+    for (let i = historyData.length - 1; i >= 0; i--) {
+      if (historyData[i].role !== 'user') continue
+      if (historyData[i].content.trim() === current) return historyData.slice(0, i)
+      break
+    }
+    return historyData
+  }, [historyData, panelAsked])
+
+  // No role yet, or no session: paint NOTHING. The window is hidden in that
+  // state anyway — and painting a placeholder is exactly how the retired
+  // summoned bar used to flash before the Skipper landed.
+  if (!pinned) return null
+
+  // Tucked PILL (camera calls): the standalone mini call pill in its own
+  // frame (main resizes to the TUCKED bounds). The card surface does NOT
+  // branch here — its folded state renders inside the one Skipper layout
+  // below, so fold/unfold swaps card ⇄ dock in place in the same frame.
+  if (collapsed && surface !== 'card') {
     return (
-      <TuckedMascot
-        state={callState}
-        activity={heldActivity}
-        sendAction={sendAction}
-        onExpand={() => requestCollapsed(false)}
-      />
+      <div
+        data-qa-passthrough
+        className="flex h-screen w-screen select-none flex-col items-end justify-end overflow-hidden px-3 pb-3"
+      >
+        <style>{COMPANION_MOTION_CSS}</style>
+        <TuckedDock
+          state={callState}
+          activity={heldActivity}
+          sendAction={sendAction}
+          onExpand={() => requestCollapsed(false)}
+        />
+      </div>
     )
   }
 
-  // Pinned role, expanded to the PILL (camera/share calls): the call pill
-  // with the real composer as its typed input. Bar-originated voice calls
-  // fall through to the card layout below instead (callCard).
-  if (pinned && surface === 'pill') {
+  // Expanded to the PILL (camera calls): the call pill with the real
+  // composer as its typed input. Voice sessions use the card below.
+  if (surface === 'pill') {
     return (
       <>
         <PinnedPill
@@ -734,6 +615,7 @@ export function QuickAskBar() {
           onCollapse={() => requestCollapsed(true)}
           composer={
             <ChatInputWithMentions
+              showModelSelector={false}
               knowledgeFiles={knowledgeFiles}
               recentFiles={[]}
               visibleFiles={knowledgeFiles}
@@ -753,77 +635,52 @@ export function QuickAskBar() {
     )
   }
 
-  // The bar-style card — summoned (no call), or the SKIPPER (a live voice
-  // call on the card surface, text panel open or folded). One layout: the
-  // mascot column below is the SAME mounted node in both Skipper states —
-  // fold/unfold only adds/removes the card beside it, so the mascot never
-  // moves, resizes, or replays its entry animation. The exchange comes from
-  // the call's mirror on the call card, from the quick-ask mirror summoned.
-  const skipper = pinned && surface === 'card'
-  const panelAsked = callCard ? callState.questionText : asked
-  const panelText = callCard ? (callState.responseText ?? '') : (answer?.text ?? '')
-  const panelProcessing = callCard ? callState.status === 'thinking' : processing
-  const panelStatusText = callCard
-    ? (heldActivity ?? 'Thinking…')
-    : (answer?.statusText || 'Thinking…')
-  // One-line caption under the Skipper's mascot: the in-flight utterance
-  // wins; otherwise the tail of the reply while it speaks.
-  const skipperReplyTail =
-    skipper && (callState.ttsState !== 'idle' || callState.status === 'thinking')
-      ? (callState.responseText ?? '')
-          .replace(/[#*_`>[\]]/g, '')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(-90)
-      : ''
-  const skipperCaption = skipper ? (callState.interimText || skipperReplyTail) : ''
-
-  // History includes the chat's LATEST messages — but the current exchange
-  // is already rendered below the "earlier" divider, so trim it off the
-  // tail. Matched on the question text (the reliable key: a streaming reply
-  // can differ from its stored copy): drop the newest user message and
-  // everything after it iff it IS the question on display.
-  const earlierItems = useMemo(() => {
-    if (!historyData) return historyData
-    const current = (panelAsked ?? '').trim()
-    if (!current) return historyData
-    for (let i = historyData.length - 1; i >= 0; i--) {
-      if (historyData[i].role !== 'user') continue
-      if (historyData[i].content.trim() === current) return historyData.slice(0, i)
-      break
-    }
-    return historyData
-  }, [historyData, panelAsked])
-
+  // THE SKIPPER — the one hover surface: a single self-contained card
+  // (destination strip, composer, footer dock). The text card floats freely;
+  // folding replaces it with a vertical dock at the screen's right edge.
   return (
-    <div className="flex h-screen w-screen select-none flex-col overflow-hidden">
-      {/* The invisible stage: popovers open into this zone; clicking it
-          dismisses the summoned bar (true Spotlight click-away — blur
-          dismisses it anyway, so stage and outside clicks agree). On the
-          call card, only clicks NEAR the visible card tuck the panel
-          (stageTuck hit-test) — the rest of the invisible frame is inert,
-          so clicking what looks like empty desktop never steals the panel.
-          Folded Skipper: the stage is a drag area, part of "carry it
-          around". */}
+    <div data-qa-passthrough className="flex h-screen w-screen select-none flex-col overflow-hidden">
+      <style>{COMPANION_MOTION_CSS}</style>
+      {/* The invisible stage: popovers open into this zone. It is marked
+          passthrough, so clicks that land on it go to whatever the user has
+          BEHIND this window (useClickThrough) instead of being swallowed by
+          a transparent rectangle. The only gesture it still carries is
+          tucking the panel, and only NEAR the visible card (stageTuck
+          hit-test) — reachable because the grace ring keeps the window
+          solid just outside the card's edge. (It is deliberately NOT a drag
+          region — a screen-sized invisible drag area is exactly how a click
+          on empty desktop once ended up moving the Skipper; the card is the
+          drag handle.) */}
       <div
+        data-qa-passthrough
         className="min-h-0 flex-1"
-        style={skipper && collapsed ? dragRegion : undefined}
-        onMouseDown={callCard ? stageTuck : skipper ? undefined : dismiss}
+        onMouseDown={collapsed ? undefined : stageTuck}
       />
 
-      {/* Bottom row: card + the mascot riding alongside on the transparent
-          stage. The row is PADDED so the card's CSS shadow fades inside the
-          window instead of clipping at its rectangular edge (which read as
-          a grey rectangle around the card). The paddings are IDENTICAL in
-          both Skipper states — with the corner-anchored window, that pins
-          the mascot to the exact same screen pixels across fold/unfold. */}
-      <div className="flex shrink-0 items-end justify-end gap-1 px-6 pb-5">
-      {!(skipper && collapsed) && (
-      <div className="relative min-w-0 flex-1">
-      {/* Light skin (#810): near-white card, hairline dark border, dark
-          text. The window's native shadow is off (it would outline the
-          whole transparent frame) — the card draws its own. */}
-      <div ref={cardRef} className="qa-card w-full overflow-hidden rounded-[26px] border border-black/10 bg-white/[0.97] text-neutral-900 shadow-[0_12px_32px_rgba(0,0,0,0.18),0_2px_10px_rgba(0,0,0,0.10)]">
+      {/* Preserve the text panel's original padding. Only the collapsed dock
+          removes the right gutter to meet the screen edge. */}
+      <div data-qa-passthrough className={`flex shrink-0 items-end justify-end pb-5 ${card.mounted ? 'px-6' : 'pl-6'}`}>
+      {card.mounted && (
+      <div
+        data-qa-passthrough
+        className={`relative min-w-0 flex-1 ${card.exiting ? 'qa-card-out pointer-events-none' : 'qa-card-in'}`}
+      >
+      {/* Near-white card with a hairline dark border in light; near-black
+          with a hairline light one in dark. #810 introduced the light skin as
+          the only skin — it follows the app's theme setting now (see
+          useWindowTheme above). The window's native shadow is off (it would
+          outline the whole transparent frame) — the card draws its own, and
+          draws it heavier in dark, where a soft grey haze would just vanish
+          into whatever is behind the window. */}
+      <div ref={cardRef} style={dragRegion} className="qa-card relative w-full cursor-grab overflow-hidden rounded-[26px] border border-black/10 bg-white/[0.97] text-neutral-900 shadow-[0_12px_32px_rgba(0,0,0,0.18),0_2px_10px_rgba(0,0,0,0.10)] dark:border-white/15 dark:bg-neutral-900/[0.97] dark:text-neutral-100 dark:shadow-[0_12px_32px_rgba(0,0,0,0.55),0_2px_10px_rgba(0,0,0,0.4)]">
+        {/* The card is a drag handle, like the mascot: every bit of bare
+            surface — the border, the gutters around the action strip, the
+            frame around the composer — picks the Skipper up. The CONTROLS
+            punch holes in it (noDragRegion below): Electron makes children
+            draggable unless they opt out, so each chip, the response panel
+            (its scrollbar rides the card's edge, and a scrollbar that moved
+            the window instead of the text would be a trap) and the composer
+            say so explicitly. */}
         {/* Charcoal code blocks. Streamdown's own dark rule is
             background: var(--shiki-dark-bg) !important inside Tailwind's
             utilities layer — layered !important outranks any override we
@@ -838,23 +695,31 @@ export function QuickAskBar() {
           .qa-card [data-streamdown="code-block"] {
             border-color: rgba(0, 0, 0, 0.3) !important;
           }
+          /* Same charcoal block, but a dark hairline on a dark card is an
+             invisible one — the edge has to come from the light side. */
+          .dark .qa-card [data-streamdown="code-block"] {
+            border-color: rgba(255, 255, 255, 0.15) !important;
+          }
         `}</style>
-        {/* Action strip: bar-level controls that aren't the composer's job.
-            Summoned: voice-out/share toggles (set before asking). Call
-            card: live-call status + mute + end — the call owns the devices,
-            replies are always spoken. */}
-        <div className="flex items-center justify-end gap-2 px-4 pt-3">
-          {/* Destination chip: WHICH chat this bar is continuing — click
+        {/* Action strip: the logo (the thinking beacon — it glows while a
+            turn runs) and the destination affordances on the left (where
+            the answer will land); window actions, the device controls
+            (share, talk/stop) and the small ✕ dismiss on the right. */}
+        <div className="flex items-center gap-2 px-4 pt-3">
+          <span className={`flex h-7 w-7 flex-none items-center justify-center rounded-[11px] text-neutral-700 dark:text-neutral-200 ${callState.status === 'thinking' ? 'qa-logo-glow' : ''}`}>
+            <MascotFaceIcon size={24} />
+          </span>
+          {/* Destination chip: WHICH chat this session is continuing — click
               for the recents switcher (opens upward into the transparent
-              stage). Rendered in BOTH card modes: text mode mid-call
-              retargets subsequent questions just like the summoned bar. */}
+              stage). Retargets subsequent questions mid-session. */}
           <DropdownMenu>
             <Tooltip>
               <TooltipTrigger asChild>
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex min-w-0 items-center gap-1.5 rounded-full bg-black/[0.04] py-1 pl-2.5 pr-2 text-[11px] font-medium text-neutral-600 ring-1 ring-inset ring-black/10 transition-colors hover:bg-black/[0.08] hover:text-neutral-900"
+                    style={noDragRegion}
+                    className={`flex min-w-0 items-center gap-1.5 rounded-full py-1 pl-2.5 pr-2 text-[11px] font-medium ring-1 ring-inset transition ${CHIP_SURFACE} ${CHIP_INK_LABELLED}`}
                   >
                     <MessageCircle className="h-3 w-3 shrink-0" />
                     <span className="max-w-[220px] truncate">{chatContext?.activeTitle ?? 'New chat'}</span>
@@ -863,7 +728,7 @@ export function QuickAskBar() {
                 </DropdownMenuTrigger>
               </TooltipTrigger>
               <TooltipContent side="top">
-                Questions continue this chat — click to switch · Esc {panelProcessing ? 'dismisses' : 'clears'}
+                Questions continue this chat — click to switch · Esc tucks the text away
               </TooltipContent>
             </Tooltip>
             <DropdownMenuContent align="start" side="top" className="max-h-72 w-72 overflow-y-auto">
@@ -892,36 +757,40 @@ export function QuickAskBar() {
             </DropdownMenuContent>
           </DropdownMenu>
           {/* New chat rides RIGHT NEXT to the selector — it's a destination
-              choice too. Works mid-call: the session keeps going, the next
-              questions land in the fresh chat. */}
+              choice too. The session keeps going; the next questions land
+              in the fresh chat. */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
+                style={noDragRegion}
                 onClick={newChat}
                 aria-label="New chat"
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-black/[0.04] text-neutral-500 ring-1 ring-inset ring-black/10 transition-colors hover:bg-black/[0.08] hover:text-neutral-900"
+                className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ring-1 ring-inset transition ${CHIP_IDLE}`}
               >
                 <Plus className="h-3.5 w-3.5" />
               </button>
             </TooltipTrigger>
             <TooltipContent side="top">New chat</TooltipContent>
           </Tooltip>
+          {/* Destination on the left, window actions on the right. */}
+          <span className="min-w-0 flex-1" />
           {/* History peek — display is explicit (data prefetched, shown
               only on click). */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
+                style={noDragRegion}
                 onClick={activeRunId ? toggleHistory : undefined}
                 aria-label={showHistory ? 'Hide history' : 'Peek at recent history'}
                 aria-disabled={!activeRunId}
-                className={`${callCard ? '' : 'mr-auto '}flex h-7 w-7 shrink-0 items-center justify-center rounded-full ring-1 ring-inset transition-colors ${
+                className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ring-1 ring-inset transition ${
                   showHistory
-                    ? 'bg-black/[0.08] text-neutral-900 ring-black/15'
+                    ? CHIP_ACTIVE
                     : activeRunId
-                      ? 'bg-black/[0.04] text-neutral-500 ring-black/10 hover:bg-black/[0.08] hover:text-neutral-900'
-                      : 'cursor-default bg-black/[0.04] text-neutral-300 ring-black/5'
+                      ? CHIP_IDLE
+                      : CHIP_DISABLED
                 }`}
               >
                 {showHistory ? <ChevronsDown className="h-3.5 w-3.5" /> : <ChevronsUp className="h-3.5 w-3.5" />}
@@ -935,146 +804,113 @@ export function QuickAskBar() {
                   : 'No history yet — this is a new chat'}
             </TooltipContent>
           </Tooltip>
-          {/* Call controls live on the MASCOT (the same pins as the folded
-              Skipper); this strip keeps chat-destination affordances plus
-              the speaker mute — a "read instead of listen" choice that only
+          {/* The speaker mute — a "read instead of listen" choice that only
               exists while the text panel does (folding auto-unmutes). */}
-          {callCard && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={() => sendAction('toggle-speaker')}
-                  aria-label={callState.speakerMuted ? 'Unmute spoken replies' : 'Mute spoken replies'}
-                  className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ring-1 ring-inset transition-colors ${
-                    callState.speakerMuted
-                      ? 'bg-black/[0.04] text-neutral-500 ring-black/10 hover:bg-black/[0.08] hover:text-neutral-900'
-                      : 'bg-sky-500/15 text-sky-700 ring-sky-500/30'
-                  }`}
-                >
-                  {callState.speakerMuted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="top">
-                {callState.speakerMuted
-                  ? 'Replies are silent while the text is open — click to speak them again'
-                  : 'Spoken questions are answered aloud — click to read replies silently instead'}
-              </TooltipContent>
-            </Tooltip>
-          )}
-          {!callCard && (
-            <>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={toggleVoiceOut}
-                    aria-label={voiceOut ? 'Stop speaking answers' : 'Speak answers aloud'}
-                    className={`flex h-7 w-7 items-center justify-center rounded-full ring-1 ring-inset transition-colors ${
-                      voiceOut
-                        ? 'bg-sky-500/15 text-sky-700 ring-sky-500/30'
-                        : 'bg-black/[0.04] text-neutral-500 ring-black/10 hover:bg-black/[0.08] hover:text-neutral-900'
-                    }`}
-                  >
-                    <Volume2 className="h-3.5 w-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="top">
-                  {voiceOut ? 'Answers are spoken — click to mute' : 'Speak answers aloud'}
-                </TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={toggleShare}
-                    aria-label={sharing ? 'Stop sharing your screen' : 'Share your screen'}
-                    className={`flex h-7 w-7 items-center justify-center rounded-full ring-1 ring-inset transition-colors ${
-                      sharing
-                        ? 'bg-emerald-500/15 text-emerald-700 ring-emerald-500/30'
-                        : 'bg-black/[0.04] text-neutral-500 ring-black/10 hover:bg-black/[0.08] hover:text-neutral-900'
-                    }`}
-                  >
-                    <MonitorUp className="h-3.5 w-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="top">
-                  {sharing ? 'Sharing your screen with this chat — click to stop' : 'Share your screen with this chat'}
-                </TooltipContent>
-              </Tooltip>
-            </>
-          )}
-          {/* Jump-to-app stays on the right — it's a window action, not a
-              destination choice. Present on EVERY surface (Skipper card
-              included): the one bridge from hover to the app's side pane. */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
+                style={noDragRegion}
+                onClick={() => sendAction('toggle-speaker')}
+                aria-label={callState.speakerMuted ? 'Unmute spoken replies' : 'Mute spoken replies'}
+                className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ring-1 ring-inset transition ${
+                  callState.speakerMuted
+                    ? CHIP_IDLE
+                    : 'bg-sky-500/15 text-sky-700 ring-sky-500/30 dark:bg-sky-400/20 dark:text-sky-300 dark:ring-sky-400/30'
+                }`}
+              >
+                {callState.speakerMuted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {callState.speakerMuted
+                ? 'Replies are silent while the text is open — click to speak them again'
+                : 'Spoken questions are answered aloud — click to read replies silently instead'}
+            </TooltipContent>
+          </Tooltip>
+          {/* Jump-to-app stays on the right — it's a window action, not a
+              destination choice: the one bridge from hover to the app's
+              side pane. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                style={noDragRegion}
                 onClick={openInApp}
                 aria-label="Open in Rowboat"
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-black/[0.04] text-neutral-500 ring-1 ring-inset ring-black/10 transition-colors hover:bg-black/[0.08] hover:text-neutral-900"
+                className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ring-1 ring-inset transition ${CHIP_IDLE}`}
               >
                 <ArrowUpRight className="h-3.5 w-3.5" />
               </button>
             </TooltipTrigger>
             <TooltipContent side="top">Open this chat in Rowboat's side pane</TooltipContent>
           </Tooltip>
+          {/* Device controls — the call owns them. The lit share button IS
+              the consent badge (sky + pulsing dot while broadcasting). */}
+          <ShareButton state={callState} sendAction={sendAction} className="h-7 w-7" />
+          <TalkButton state={callState} sendAction={sendAction} className="h-7 w-7" />
+          {/* End & close, as a small window-dismiss ✕ in the corner. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                style={noDragRegion}
+                onClick={() => sendAction('end-call')}
+                aria-label="End the voice session and close"
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:bg-red-500/10 hover:text-red-600 active:scale-95 dark:text-neutral-500 dark:hover:bg-red-400/10 dark:hover:text-red-400"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">End & close (a live session can't be hidden while it keeps listening)</TooltipContent>
+          </Tooltip>
         </div>
 
         {(panelAsked || panelText || showHistory) && (
           <div
             ref={panelScrollRef}
-            className="max-h-[280px] cursor-text select-text overflow-y-auto px-6 pb-3 pt-2 text-sm leading-relaxed text-neutral-800"
+            style={noDragRegion}
+            className="qa-rise max-h-[280px] cursor-text select-text overflow-y-auto px-6 pb-3 pt-2 text-sm leading-relaxed text-neutral-800 dark:text-neutral-200"
           >
             {showHistory && historyData === null && (
               <div className="mb-2 animate-pulse text-xs text-neutral-400">Loading history…</div>
             )}
+            {/* Peeked history and the live exchange are the SAME two turn
+                shapes in the same order — the only thing between them is the
+                rule saying where the past stops. (They used to diverge: the
+                history was blanket-dimmed, its questions were bare grey
+                text, and the rule between them was labelled "earlier" while
+                sitting above the newest turn of all.) */}
             {showHistory && earlierItems !== null && (
               <div className="mb-1">
                 {earlierItems.length === 0 ? (
                   <div className="mb-2 text-xs text-neutral-400">No earlier messages in this chat.</div>
                 ) : (
-                  <div className="opacity-75">
-                    {earlierItems.map((m, i) =>
-                      m.role === 'user' ? (
-                        <div key={i} className="mb-1.5 mt-3 text-sm font-medium text-neutral-500 first:mt-0">
-                          {m.content}
-                        </div>
-                      ) : (
-                        <Streamdown
-                          key={i}
-                          className="dark prose prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_p]:my-1.5 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_pre]:my-2 [&_pre]:text-[11px] [&_code]:text-[11px] [&_:not(pre)>code]:rounded [&_:not(pre)>code]:bg-black/[0.06] [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:text-neutral-800"
-                        >
-                          {m.content}
-                        </Streamdown>
-                      ),
-                    )}
-                  </div>
+                  earlierItems.map((m, i) =>
+                    m.role === 'user' ? (
+                      <UserTurn key={i}>{m.content}</UserTurn>
+                    ) : (
+                      <AssistantTurn key={i}>{m.content}</AssistantTurn>
+                    ),
+                  )
                 )}
-                {(panelAsked || panelText) && earlierItems.length > 0 && (
-                  <div className="my-2 flex items-center gap-2 text-[9px] uppercase tracking-wider text-neutral-400">
-                    <span className="h-px flex-1 bg-black/10" />
-                    earlier
-                    <span className="h-px flex-1 bg-black/10" />
-                  </div>
-                )}
+                {(panelAsked || panelText) && earlierItems.length > 0 && <TurnDivider>now</TurnDivider>}
               </div>
             )}
             {/* Inside the scroll area — the question scrolls away with the
                 answer instead of persisting as a header. */}
-            {panelAsked && <div className="mb-2 text-sm font-medium text-neutral-500">{panelAsked}</div>}
+            {panelAsked && <UserTurn>{panelAsked}</UserTurn>}
             {panelText ? (
-              /* `.dark` scoped to the markdown only: shiki's token colors key
-                 off a .dark ancestor, so this flips code to its dark palette
-                 (matching the charcoal block bg) without darkening the rest
-                 of the light panel — the prose classes here are explicit. */
-              <Streamdown className="dark prose prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_p]:my-1.5 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_pre]:my-2 [&_pre]:text-[11px] [&_code]:text-[11px] [&_:not(pre)>code]:rounded [&_:not(pre)>code]:bg-black/[0.06] [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:text-neutral-800">
-                {panelText}
-              </Streamdown>
+              <AssistantTurn>{panelText}</AssistantTurn>
             ) : (
               panelProcessing && (
-                <span className="animate-pulse text-neutral-500">{panelStatusText}</span>
+                /* The thinking/searching animation lives here now (the
+                   footer status lane is gone): the running activity as
+                   shimmer text behind a slow spinner. */
+                <span className="flex items-center gap-2">
+                  <Loader className="qa-spin h-3.5 w-3.5 flex-none text-sky-500 dark:text-sky-400" />
+                  <span className="qa-shimmer font-medium">{panelStatusText}</span>
+                </span>
               )
             )}
             {panelProcessing && panelText && <span className="animate-pulse">▍</span>}
@@ -1083,161 +919,94 @@ export function QuickAskBar() {
 
         {/* The real composer. Submits relay the FULL payload (mentions,
             attachments, search/code/permissions, model/effort) to the app
-            window, which submits into the active chat exactly like an
-            in-app composer message. */}
-        <div className="border-t border-black/5 p-3">
-          <ChatInputWithMentions
-            knowledgeFiles={knowledgeFiles}
-            recentFiles={[]}
-            visibleFiles={knowledgeFiles}
-            onSubmit={submit}
-            onStop={callCard ? () => sendAction('stop-speaking') : stop}
-            isProcessing={panelProcessing}
-            runId={null}
-            placeholder={callCard ? 'Type instead — @ mentions work too…' : 'Ask Rowboat anything…'}
-            focusSignal={focusSignal}
-            onSelectionChange={(sel) => {
-              selectionRef.current = sel ?? null
-            }}
-            isRecording={callCard ? undefined : recording}
-            recordingText={callCard ? undefined : voice.interimText}
-            recordingState={
-              callCard
-                ? undefined
-                : voice.state === 'submitting'
-                  ? 'stopping'
-                  : voice.state === 'connecting'
-                    ? 'connecting'
-                    : 'listening'
-            }
-            audioLevelsRef={voice.audioLevelsRef}
-            onStartRecording={callCard ? undefined : startRecording}
-            onSubmitRecording={callCard ? undefined : submitRecording}
-            onCancelRecording={callCard ? undefined : cancelRecording}
-            voiceAvailable={callCard ? false : voiceAvailable}
-          />
+            window, which submits into the companion's chat exactly like an
+            in-app composer message. While the mic gate is open it flips to
+            its own recording bar — the SAME waveform + interim transcript
+            as the app composer's dictation — wired to the call's PTT
+            machine: ↑ sends (ptt-up), ✕ discards (ptt-cancel). */}
+        <div className="p-3">
+          {/* The composer opts out of the card's drag region — the frame
+              around it stays a grab handle. */}
+          <div style={noDragRegion}>
+            <ChatInputWithMentions
+              showModelSelector={false}
+              knowledgeFiles={knowledgeFiles}
+              recentFiles={[]}
+              visibleFiles={knowledgeFiles}
+              onSubmit={submit}
+              onStop={() => sendAction('stop-speaking')}
+              isProcessing={panelProcessing}
+              runId={null}
+              placeholder={`Ask anything. Hold ${PTT_LABEL} to speak`}
+              focusSignal={focusSignal}
+              onSelectionChange={(sel) => {
+                selectionRef.current = sel ?? null
+              }}
+              voiceAvailable={false}
+              isRecording={micOpen}
+              recordingText={callState.interimText ?? ''}
+              recordingState="listening"
+              audioLevelsRef={levelsRef}
+              onSubmitRecording={() => sendAction('ptt-up')}
+              onCancelRecording={() => sendAction('ptt-cancel')}
+            />
+          </div>
         </div>
       </div>
 
-      {/* Tuck handle on the card's mascot-side edge: push the text into the
-          mascot → voice-to-voice. Summoned it STARTS the voice-preset call;
-          on the call card it just tucks (the call keeps going). Dimmed —
-          never hidden — when voice isn't configured, so the feature stays
-          discoverable without dead-end clicks. */}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            onClick={callCard ? () => requestCollapsed(true) : callAvailable ? tuck : undefined}
-            aria-label="Tuck into the mascot — voice-to-voice"
-            aria-disabled={!callCard && !callAvailable}
-            className={`absolute -right-3 top-1/2 z-10 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-black/10 bg-white text-neutral-500 shadow-[0_2px_8px_rgba(0,0,0,0.15)] transition-colors ${
-              callCard || callAvailable ? 'hover:bg-neutral-50 hover:text-neutral-900' : 'cursor-default opacity-40'
-            }`}
-          >
-            <ChevronsRight className="h-3.5 w-3.5" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="top">
-          {callCard
-            ? 'Tuck the text away — the call keeps going'
-            : callAvailable
-              ? 'Tuck into the mascot — talk instead of type'
-              : 'Voice-to-voice needs voice input & output configured in Settings'}
-        </TooltipContent>
-      </Tooltip>
+      {/* Tuck handle on the card's right edge: fold the card down to the
+          mini call pill. The session keeps going.
+
+          This wrapper is the DRAG-REGION HOLE, so it is static and
+          transform-free (placed with calc, not -translate-y-1/2). The button
+          used to BE the hole while carrying three transforms — the centring
+          translate plus hover:translate-x and active:scale — and Electron
+          punches holes from the rect Blink last computed on style/layout
+          invalidation, not once per composited frame. So the hole sat
+          wherever the last animation left it while the art painted
+          elsewhere, and a press on the visible circle landed on the card's
+          drag region instead: on Windows that is HTCAPTION, the window
+          enters the OS move loop and the click never happens. That is the
+          "sometimes it works" report.
+
+          The hole is deliberately bigger than the art — 32px around a 24px
+          circle, the same oversized-target trick as the dock's buttons. It
+          hangs 16px past the card edge into the frame's own padding;
+          pointer-events-none here (with the button opting back in) keeps
+          the overhang from swallowing presses meant for whatever paints
+          beneath it. */}
+      <span
+        className="pointer-events-none absolute z-10 flex h-8 w-8 items-center justify-center"
+        style={{ ...noDragRegion, top: 'calc(50% - 16px)', right: '-16px' }}
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={() => requestCollapsed(true)}
+              aria-label="Tuck the text away"
+              className="pointer-events-auto flex h-6 w-6 items-center justify-center rounded-full border border-black/10 bg-white text-neutral-500 shadow-[0_2px_8px_rgba(0,0,0,0.15)] transition hover:translate-x-0.5 hover:bg-neutral-50 hover:text-neutral-900 active:scale-90 dark:border-white/15 dark:bg-neutral-800 dark:text-neutral-400 dark:shadow-[0_2px_8px_rgba(0,0,0,0.5)] dark:hover:bg-neutral-700 dark:hover:text-neutral-100"
+            >
+              <ChevronsRight className="h-3.5 w-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top">Tuck the text away — the session keeps going</TooltipContent>
+        </Tooltip>
+      </span>
       </div>
       )}
 
-      {/* The mascot column — the Skipper's CONSTANT. One mounted node for
-          both Skipper states (text open or folded): identical size, pins,
-          caption slot, and status chip, at identical offsets from the
-          window's bottom-right corner — which the corner-anchored window
-          keeps fixed on screen, so fold/unfold moves NOTHING here; only the
-          card beside it comes and goes. It is the control surface AND the
-          drag handle. Summoned (no call) it stays the inert 124px bobbing
-          silhouette. */}
-      <div
-        className={`relative flex w-[132px] shrink-0 select-none flex-col items-center ${skipper ? 'cursor-grab' : 'pointer-events-none'}`}
-        style={skipper ? dragRegion : undefined}
-        aria-hidden={skipper ? undefined : true}
-        title={skipper ? 'Drag to move your Skipper' : undefined}
-      >
-        {skipper && (
-          <style>{`
-            @keyframes listen-ring {
-              0% { transform: scale(0.72); opacity: 0.9; }
-              100% { transform: scale(1.28); opacity: 0; }
-            }
-            @keyframes skipper-pop {
-              0% { opacity: 0; transform: scale(0.5); }
-              100% { opacity: 1; transform: scale(1); }
-            }
-          `}</style>
-        )}
-        <div
-          className="relative -mb-4"
-          style={skipper ? { animation: 'skipper-pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1)' } : undefined}
-        >
-          {/* Listening halo — rings pulse around the head while the mic
-              gate is open, so "press ⌘ and speak" is visibly working in
-              both states. */}
-          {skipper && !callState.micMuted && (callState.status === 'listening' || callState.pttLocked) && (
-            <>
-              <span
-                className="pointer-events-none absolute left-1/2 z-10 rounded-full border-[3px] border-green-400/90"
-                style={{ top: '42%', width: 104, height: 104, marginLeft: -52, marginTop: -52, animation: 'listen-ring 1.5s cubic-bezier(0, 0, 0.2, 1) infinite' }}
-              />
-              <span
-                className="pointer-events-none absolute left-1/2 z-10 rounded-full border-[3px] border-green-400/90"
-                style={{ top: '42%', width: 104, height: 104, marginLeft: -52, marginTop: -52, animation: 'listen-ring 1.5s cubic-bezier(0, 0, 0.2, 1) 0.5s infinite' }}
-              />
-            </>
-          )}
-          <TalkingHead
-            ttsState={
-              skipper
-                ? callState.status === 'thinking' && callState.ttsState === 'idle'
-                  ? 'synthesizing'
-                  : callState.ttsState
-                : processing
-                  ? 'synthesizing'
-                  : 'idle'
-            }
-            getLevel={skipper ? synthLevel : zeroLevel}
-            size={skipper ? 132 : 124}
-            hat={skipper ? 'cowboy' : undefined}
-            hatOverlay={
-              skipper ? (
-                <SkipperPins
-                  state={callState}
-                  sendAction={sendAction}
-                  textPin={collapsed ? 'expand' : 'collapse'}
-                  onTextPin={() => requestCollapsed(!collapsed)}
-                />
-              ) : undefined
-            }
-          />
-        </div>
-        {skipper && (
-          <>
-            {/* Fixed-height caption + chip slots: present in BOTH states so
-                the head never shifts when a caption appears or the text
-                folds. Both are single-line and CENTERED on the mascot —
-                wider than the 132px column they overflow it symmetrically
-                (the column doesn't clip), which reads as a caption under
-                the head instead of a squeezed left-ragged wrap. */}
-            <div className="flex h-4 items-center">
-              {skipperCaption && (
-                <span className="max-w-[176px] truncate whitespace-nowrap rounded bg-black/70 px-1.5 py-px text-[10px] text-white/90">{skipperCaption}</span>
-              )}
-            </div>
-            <div className="flex h-6 items-center">
-              <SkipperStatusChip state={callState} activity={heldActivity} />
-            </div>
-          </>
-        )}
-      </div>
+      {/* After the text card exits, main moves this vertical dock to the
+          screen's right edge while remembering the floating card position. */}
+      {!card.mounted && (
+        <TuckedDock
+          vertical
+          state={callState}
+          activity={heldActivity}
+          sendAction={sendAction}
+          onExpand={() => requestCollapsed(false)}
+        />
+      )}
       </div>
       <SonnerToaster theme="light" />
     </div>
@@ -1245,11 +1014,310 @@ export function QuickAskBar() {
 }
 
 const STATUS_DISPLAY: Record<NonNullable<CallState['status']>, { label: string; dotClass: string }> = {
-  idle: { label: 'Hold right ⌘ to talk', dotClass: 'bg-neutral-500' },
-  listening: { label: 'Listening', dotClass: 'bg-green-500 animate-pulse' },
+  idle: { label: `Hold ${PTT_LABEL} to talk`, dotClass: 'bg-neutral-500' },
+  listening: { label: 'Listening', dotClass: 'bg-[var(--rowboat-success)] animate-pulse' },
   thinking: { label: 'Thinking…', dotClass: 'bg-amber-400' },
   speaking: { label: 'Speaking', dotClass: 'bg-sky-400 animate-pulse' },
 }
+
+/**
+ * Marks a container that only ever covers EMPTY space — the transparent
+ * frame's own scaffolding. See `useClickThrough`.
+ */
+const PASSTHROUGH_ATTR = 'data-qa-passthrough'
+
+/**
+ * Per-region click-through for the transparent frame.
+ *
+ * The window is far bigger than anything it paints: a tall invisible stage
+ * sits above the card so popovers can open upward without resizing, and the
+ * tucked Skipper is just the mascot in that same frame. But a transparent
+ * pixel is still a CLICKABLE pixel — macOS routes a click to the topmost
+ * window by its RECT, not by alpha — so that stage used to swallow every
+ * click that landed on it: a ~500px square of dead desktop.
+ *
+ * Main therefore keeps the window click-through and this hook flips it solid
+ * while the cursor is over something actually drawn.
+ *
+ * The cursor position comes from MAIN (`quick-ask:cursor`, polled from the
+ * OS), not from mouse events. Events cannot be trusted for this: on macOS a
+ * `-webkit-app-region: drag` area is a native view layered over the page, so
+ * moves across it never reach us — and the mascot is exactly that area. Off
+ * events alone it stayed click-through, so the Skipper could be neither
+ * clicked nor dragged. Local mousemoves are still handled, purely because
+ * they arrive sooner than the next poll where they do arrive at all.
+ *
+ * The test is INVERTED on purpose: only the frame's own containers are
+ * marked passthrough, so anything else under the cursor — including menus
+ * portaled to <body>, and anything added later — counts as solid and stays
+ * clickable by default. Getting it wrong that way costs a dead pixel;
+ * getting it wrong the other way costs an unclickable control.
+ */
+function useClickThrough(active: boolean) {
+  useEffect(() => {
+    if (!active) return
+    let sent: boolean | null = null
+    const push = (interactive: boolean) => {
+      if (interactive === sent) return
+      sent = interactive
+      void window.ipc.invoke('quickAsk:setInteractive', { interactive }).catch(() => {})
+    }
+    const solidAt = (x: number, y: number) => {
+      const el = document.elementFromPoint(x, y)
+      if (!el || el === document.documentElement || el === document.body) return false
+      if (el.id === 'root') return false
+      return !el.hasAttribute(PASSTHROUGH_ATTR)
+    }
+    // The flip is an IPC round-trip, so turn solid slightly BEFORE the
+    // cursor reaches paint: a fast move landing straight on a control must
+    // not have its click fall through the window.
+    const GRACE = 12
+    // A menu, picker or dialog is open somewhere: stay solid wherever the
+    // cursor is, or the click that should DISMISS it would land in the app
+    // behind us and leave it open. Tooltips are excluded — they carry no
+    // dismiss gesture, and they are on screen exactly while the cursor is
+    // already over a control.
+    const dismissableOpen = () =>
+      Array.from(document.querySelectorAll('[data-radix-popper-content-wrapper]')).some(
+        (wrapper) => !wrapper.querySelector('[role="tooltip"]'),
+      )
+    const evaluate = (x: number, y: number) => {
+      // The cursor left the frame (main pushes one out-of-viewport point as
+      // it goes): hand the mouse straight back. Checked before anything
+      // else so the grace ring can't hold the window solid on the way out.
+      if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+        push(false)
+        return
+      }
+      if (dismissableOpen()) {
+        push(true)
+        return
+      }
+      push(
+        solidAt(x, y) ||
+          solidAt(x - GRACE, y) ||
+          solidAt(x + GRACE, y) ||
+          solidAt(x, y - GRACE) ||
+          solidAt(x, y + GRACE),
+      )
+    }
+    const onMove = (e: MouseEvent) => evaluate(e.clientX, e.clientY)
+    const offCursor = window.ipc.on('quick-ask:cursor', (p) => evaluate(p.x, p.y))
+    document.addEventListener('mousemove', onMove, true)
+    return () => {
+      offCursor()
+      document.removeEventListener('mousemove', onMove, true)
+      push(false)
+    }
+  }, [active])
+}
+
+/**
+ * Grab → GRABBING while the Skipper is actually moving.
+ *
+ * The handles (the card and the mascot column) are drag regions, and a drag
+ * region is native: on Windows the hit test answers HTCAPTION, on macOS it is
+ * a view layered over the page. Neither ever delivers the mousedown, so
+ * `:active` — the obvious way to write this — is never true here. Main
+ * watches the window's own 'move' instead and pushes the edges of the drag
+ * (quick-ask:dragging); this flips a class on <html> that the rule below
+ * turns into the closed-hand cursor everywhere, since during a drag the
+ * pointer is over a handle by definition.
+ *
+ * The rule is injected rather than rendered: the window has several
+ * presentations (card, pill, tucked mascot) and each is an early return, so
+ * a <style> in any one of them would be missing from the others.
+ */
+function useDragCursor() {
+  useEffect(() => {
+    const style = document.createElement('style')
+    style.textContent = 'html.qa-dragging, html.qa-dragging * { cursor: grabbing !important; }'
+    document.head.appendChild(style)
+    const off = window.ipc.on('quick-ask:dragging', ({ dragging }) => {
+      document.documentElement.classList.toggle('qa-dragging', dragging)
+    })
+    return () => {
+      off()
+      style.remove()
+      document.documentElement.classList.remove('qa-dragging')
+    }
+  }, [])
+}
+
+/**
+ * How long the card's fold-away runs. The node has to stay mounted for it
+ * (see usePresence), so main and the renderer must agree on one number.
+ */
+const CARD_EXIT_MS = 200
+
+/**
+ * Keep a node on screen for its exit animation.
+ *
+ * The card's `collapsed` comes from MAIN — the renderer never flips it
+ * optimistically, because main owns the window geometry with it — so the
+ * card would otherwise vanish between one commit and the next, with nothing
+ * to animate. This holds the node for `exitMs` after it goes away and says
+ * which half of the motion it is in.
+ */
+function usePresence(visible: boolean, exitMs: number) {
+  const [mounted, setMounted] = useState(visible)
+  // Coming back is instant — remount in the SAME commit that flips visible,
+  // so the entry animation starts on the frame the fold was undone. (Render-
+  // time previous-state adjustment, React's no-effect pattern: an effect here
+  // would cost a blank frame first.)
+  const [prevVisible, setPrevVisible] = useState(visible)
+  if (prevVisible !== visible) {
+    setPrevVisible(visible)
+    if (visible) setMounted(true)
+  }
+  // Going away waits for the animation.
+  useEffect(() => {
+    if (visible) return
+    const t = setTimeout(() => setMounted(false), exitMs)
+    return () => clearTimeout(t)
+  }, [visible, exitMs])
+  return { mounted, exiting: mounted && !visible }
+}
+
+/**
+ * The window's motion, in one place. It is deliberately small and quick:
+ * this thing floats over the user's actual work, so anything showy here is
+ * a distraction rather than a delight. The card folds TOWARD the mascot
+ * (transform-origin at the corner the window is anchored by), which is
+ * where the text is going.
+ */
+const COMPANION_MOTION_CSS = `
+  @keyframes qa-card-in {
+    from { opacity: 0; transform: translateX(28px) scale(0.94); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes qa-card-out {
+    from { opacity: 1; transform: none; }
+    to { opacity: 0; transform: translateX(28px) scale(0.94); }
+  }
+  @keyframes qa-rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes qa-pop-in {
+    from { opacity: 0; transform: translateY(10px) scale(0.7); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes qa-wave {
+    0%, 100% { transform: scaleY(0.45); }
+    50% { transform: scaleY(1); }
+  }
+  @keyframes qa-speak {
+    0%, 100% { transform: scaleY(0.2); opacity: 0.55; }
+    50% { transform: scaleY(1); opacity: 1; }
+  }
+  @keyframes qa-shim {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  @keyframes qa-glow {
+    0%, 100% { box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.16), 0 0 12px rgba(14, 165, 233, 0.28); }
+    50% { box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.30), 0 0 22px rgba(14, 165, 233, 0.52); }
+  }
+  @keyframes qa-spin-slow {
+    to { transform: rotate(360deg); }
+  }
+  /* Both halves name their own easing rather than a shared ease: the card
+     should LEAVE with gathering speed and ARRIVE with none, which is the
+     difference between a fold that snaps and one that settles. Both classes
+     sit on the card's WRAPPER, never on the card itself: the card is a drag
+     region, and a region that animates its transform leaves Electron
+     punching the hole where the animation started. */
+  .qa-card-in,
+  .qa-card-out { transform-origin: 100% 80%; }
+  .qa-card-in { animation: qa-card-in 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
+  .qa-card-out { animation: qa-card-out ${CARD_EXIT_MS}ms cubic-bezier(0.4, 0, 0.9, 0.3) forwards; }
+  .qa-rise { animation: qa-rise 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
+  /* The dock's entry. No extra delay: it mounts only after the card's exit
+     (usePresence gates it), so it always arrives into space the card has
+     already left. Like qa-card-in, it sits on a WRAPPER of the drag
+     regions, never on one. */
+  .qa-pop { transform-origin: 100% 100%; animation: qa-pop-in 0.26s cubic-bezier(0.34, 1.56, 0.64, 1); }
+  /* Status-lane dressing: the waveform's bars, the resting dotted line, the
+     thinking shimmer, and the logo's working glow. All of it lives INSIDE
+     drag regions and none of it is a drag-region hole, so animating here is
+     safe — and the glow moves box-shadow only, never the rect. */
+  .qa-wave-bar { animation: qa-wave 1.05s ease-in-out infinite; }
+  .qa-speak-bar { animation: qa-speak 1.2s ease-in-out infinite; }
+  .qa-shimmer {
+    background-image: linear-gradient(90deg, #9ca3af 25%, #303030 50%, #9ca3af 75%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: qa-shim 1.6s linear infinite;
+  }
+  html.dark .qa-shimmer {
+    background-image: linear-gradient(90deg, #6b7280 25%, #e5e5e5 50%, #6b7280 75%);
+  }
+  .qa-spin { animation: qa-spin-slow 2.4s linear infinite; }
+  .qa-logo-glow { animation: qa-glow 1.8s ease-in-out infinite; }
+  /* Animate only the halo: the icon and its clickable bounds stay still. */
+  .qa-dock-logo { position: relative; --qa-halo-rgb: 23 23 23; }
+  html.dark .qa-dock-logo { --qa-halo-rgb: 229 229 229; }
+  .qa-dock-logo::after {
+    content: ''; position: absolute; inset: 0; border-radius: 50%;
+    pointer-events: none; border: 1.5px solid transparent;
+  }
+  .qa-dock-logo[data-status="listening"]::after {
+    border: 2px solid rgb(var(--qa-halo-rgb));
+    box-shadow: 0 0 6px rgb(var(--qa-halo-rgb) / 30%);
+    animation: qa-dock-listening 1.4s ease-in-out infinite;
+  }
+  .qa-dock-logo[data-status="listening"]::before {
+    content: ''; position: absolute; inset: 0; border-radius: 50%;
+    pointer-events: none; border: 1px solid rgb(var(--qa-halo-rgb));
+    animation: qa-dock-listening-ripple 1.4s ease-out infinite;
+  }
+  .qa-dock-logo[data-status="thinking"]::after {
+    border-top-color: rgb(var(--qa-halo-rgb)); border-right-color: rgb(var(--qa-halo-rgb));
+    animation: qa-spin-slow 2.4s linear infinite;
+  }
+  .qa-speech-crests {
+    position: absolute; inset: -5px; width: 44px; height: 44px;
+    pointer-events: none; color: rgb(var(--qa-halo-rgb));
+  }
+  .qa-speech-crest {
+    transform-box: fill-box; transform-origin: center;
+    opacity: 0; animation: qa-speech-crest 1.35s ease-in-out infinite;
+  }
+  .qa-speech-crest-left { --qa-crest-shift: -1px; }
+  .qa-speech-crest-right { --qa-crest-shift: 1px; animation-delay: 0.08s; }
+  .qa-speech-crest-outer { animation-delay: 0.18s; }
+  .qa-speech-crest-right.qa-speech-crest-outer { animation-delay: 0.26s; }
+  @keyframes qa-dock-listening {
+    0%, 100% {
+      opacity: 0.45; transform: scale(0.9);
+      box-shadow: 0 0 3px rgb(var(--qa-halo-rgb) / 15%);
+    }
+    50% {
+      opacity: 1; transform: scale(1.12);
+      box-shadow: 0 0 0 2px rgb(var(--qa-halo-rgb) / 18%), 0 0 14px rgb(var(--qa-halo-rgb) / 65%);
+    }
+  }
+  @keyframes qa-dock-listening-ripple {
+    0% { opacity: 0.7; transform: scale(0.95); }
+    85%, 100% { opacity: 0; transform: scale(1.3); }
+  }
+  @keyframes qa-speech-crest {
+    0%, 100% { opacity: 0; transform: translateX(0) scaleY(0.88); }
+    25% { opacity: 0.8; transform: translateX(0) scaleY(1); }
+    75% { opacity: 0; transform: translateX(var(--qa-crest-shift)) scaleY(1.1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .qa-card-in, .qa-rise, .qa-pop, .qa-wave-bar, .qa-speak-bar, .qa-logo-glow, .qa-spin { animation: none; }
+    .qa-speech-crest { animation: none; opacity: 0.65; transform: none; }
+    .qa-dock-logo[data-status]::after { animation: none; }
+    .qa-dock-logo[data-status]::before { animation: none; opacity: 0; }
+    .qa-card-out { animation: none; opacity: 0; }
+    .qa-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; }
+  }
+`
 
 const dragRegion = { WebkitAppRegion: 'drag' } as React.CSSProperties
 const noDragRegion = { WebkitAppRegion: 'no-drag' } as React.CSSProperties
@@ -1280,202 +1348,66 @@ function useHeldLabel(next: string | null, holdMs = 800): string | null {
 }
 
 /**
- * The Skipper's control pins — ONE cluster for both presentations (text
- * panel open or folded), riding TalkingHead's hatOverlay so they bob with
- * the artwork. Hat = voice: the mic pin, morphing into Stop while a turn is
- * in flight. Boat = surface: the share bow light, the text fold/unfold pin
- * on the left edge, ✕ end on the right. The speaker mute deliberately does
- * NOT live here — with the text folded, voice is the only output channel,
- * so the mute is the text panel's affordance. no-drag sits on EACH button:
- * Electron punches drag-region holes from painted bounds, and a zero-size
- * wrapper excludes nothing.
+ * One prose recipe for every assistant turn the panel shows — a peeked
+ * message and the reply streaming in are the same object.
+ *
+ * `.dark` is scoped to the markdown only: shiki's token colors key off a
+ * .dark ancestor, so this flips code to its dark palette (matching the
+ * charcoal block bg) whichever skin the card is wearing — the code block is
+ * charcoal in both. It does NOT darken the surrounding panel: the prose
+ * classes are explicit, and Tailwind's `dark:` needs a .dark ANCESTOR, so
+ * the class sitting on this very element doesn't trigger the dark half of
+ * the pairs in it.
  */
-function SkipperPins({
-  state,
-  sendAction,
-  textPin,
-  onTextPin,
-}: {
-  state: CallState
-  sendAction: (action: PopoutAction) => void
-  /** 'expand' = bring the text back (tucked); 'collapse' = fold it away. */
-  textPin: 'expand' | 'collapse'
-  onTextPin: () => void
-}) {
-  const shortcutState = useQuickAskShortcut()
-  const shortcutLabel = quickAskShortcut.formatShortcut(
-    shortcutState.accelerator,
-    typeof navigator !== 'undefined' && navigator.platform.toLowerCase().includes('mac'),
-  )
-  // The mic and Stop are exclusive states of ONE control: while a turn is
-  // in flight the mic is dead anyway, so the hat's single pin morphs.
-  const busy = state.status === 'thinking' || state.status === 'speaking'
+const PANEL_PROSE =
+  'dark prose prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_p]:my-1.5' +
+  ' [&_ul]:my-1.5 [&_ol]:my-1.5 [&_pre]:my-2 [&_pre]:text-[11px] [&_code]:text-[11px]' +
+  ' [&_:not(pre)>code]:rounded [&_:not(pre)>code]:bg-black/[0.06] [&_:not(pre)>code]:px-1' +
+  ' [&_:not(pre)>code]:text-neutral-800 dark:[&_:not(pre)>code]:bg-white/[0.10]' +
+  ' dark:[&_:not(pre)>code]:text-neutral-200'
+
+function AssistantTurn({ children }: { children: string }) {
+  return <Streamdown className={PANEL_PROSE}>{children}</Streamdown>
+}
+
+/**
+ * A question the user asked — the same tinted bubble whether it is the one
+ * just spoken or one peeked out of the history, so "mine" is a shape rather
+ * than a shade the reader has to infer.
+ */
+function UserTurn({ children }: { children: string }) {
   return (
-    <div>
-      {busy ? (
-        <button
-          type="button"
-          onClick={() => sendAction('stop-speaking')}
-          aria-label="Stop the assistant"
-          title="Stop — cut the reply short (the session keeps going)"
-          className="group/pin absolute flex h-[30px] w-[30px] appearance-none items-center justify-center border-0 bg-transparent p-0 outline-none -translate-x-1/2 -translate-y-1/2"
-          style={{ ...noDragRegion, left: '50%', top: '17.3%' }}
-        >
-          <span className="flex h-[18px] w-[18px] items-center justify-center rounded-full bg-red-600 shadow-sm ring-2 ring-[#17171B] transition-transform group-hover/pin:scale-110">
-            <Square className="h-2.5 w-2.5 fill-current text-white" />
-          </span>
-        </button>
-      ) : (
-        <button
-          type="button"
-          onPointerDown={(e) => {
-            if (state.micMuted) return
-            e.currentTarget.setPointerCapture(e.pointerId)
-            sendAction('ptt-down')
-          }}
-          onPointerUp={() => {
-            if (!state.micMuted) sendAction('ptt-up')
-          }}
-          onPointerCancel={() => {
-            if (!state.micMuted) sendAction('ptt-up')
-          }}
-          aria-label="Hold to talk — tap for hands-free"
-          title="Hold to talk (tap for hands-free) — or hold the right ⌘ key"
-          className="group/pin absolute flex h-[30px] w-[30px] appearance-none items-center justify-center border-0 bg-transparent p-0 outline-none -translate-x-1/2 -translate-y-1/2"
-          style={{ ...noDragRegion, left: '50%', top: '17.3%' }}
-        >
-          <span
-            className={`flex h-[18px] w-[18px] select-none items-center justify-center rounded-full shadow-sm ring-2 ring-[#17171B] transition-transform group-hover/pin:scale-110 ${
-              state.status === 'listening' || state.pttLocked ? 'bg-green-500' : 'bg-amber-400'
-            }`}
-          >
-            <Mic
-              className={`h-3 w-3 ${
-                state.status === 'listening' || state.pttLocked ? 'text-white' : 'text-[#17171B]'
-              }`}
-            />
-          </span>
-        </button>
-      )}
-      {/* The BOW LIGHT — share pin, front and center on the hull: lit sky +
-          pulsing dot = broadcasting (the lit pin IS the consent badge). The
-          choice is STICKY — future summons start already sharing until it's
-          turned off (persisted app-side). */}
-      <button
-        type="button"
-        onClick={() => sendAction('toggle-share')}
-        aria-label={state.screenSharing ? 'Stop sharing your screen' : 'Share your screen'}
-        className="group/pin absolute flex h-[30px] w-[30px] appearance-none items-center justify-center border-0 bg-transparent p-0 outline-none -translate-x-1/2 -translate-y-1/2"
-        style={{ ...noDragRegion, left: '50%', top: '73%' }}
-      >
-        <span
-          className={`relative flex h-[18px] w-[18px] items-center justify-center rounded-full shadow-sm ring-2 ring-[#17171B] transition-transform group-hover/pin:scale-110 ${
-            state.screenSharing ? 'bg-sky-500' : 'bg-neutral-600'
-          }`}
-        >
-          <MonitorUp className="h-3 w-3 text-white" />
-          {state.screenSharing && (
-            <span className="absolute -right-1 -top-1 block h-[7px] w-[7px] animate-pulse rounded-full bg-sky-300 ring-1 ring-[#17171B]" />
-          )}
-        </span>
-        <span className="pointer-events-none absolute left-1/2 top-full mt-0.5 -translate-x-1/2 whitespace-nowrap rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-medium text-white opacity-0 transition-opacity group-hover/pin:opacity-100">
-          {state.screenSharing ? 'Sharing screen — click to stop' : 'Share your screen'}
-        </span>
-      </button>
-      <button
-        type="button"
-        onClick={onTextPin}
-        aria-label={textPin === 'expand' ? 'Bring the text back' : 'Tuck the text away'}
-        title={textPin === 'expand' ? `Bring the text back (${shortcutLabel} works too)` : 'Tuck the text away — the session keeps going'}
-        className="group/pin absolute flex h-[26px] w-[26px] appearance-none items-center justify-center border-0 bg-transparent p-0 outline-none -translate-x-1/2 -translate-y-1/2"
-        style={{ ...noDragRegion, left: '18%', top: '68%' }}
-      >
-        <span className="flex h-[16px] w-[16px] items-center justify-center rounded-full bg-sky-500 shadow-sm ring-2 ring-[#17171B] transition-transform group-hover/pin:scale-125">
-          {textPin === 'expand' ? (
-            <ChevronsLeft className="h-2.5 w-2.5 text-white" />
-          ) : (
-            <ChevronsRight className="h-2.5 w-2.5 text-white" />
-          )}
-        </span>
-      </button>
-      <button
-        type="button"
-        onClick={() => sendAction('end-call')}
-        aria-label="End the voice session and close"
-        title="End & close (a live session can't be hidden while it keeps listening)"
-        className="group/pin absolute flex h-[26px] w-[26px] appearance-none items-center justify-center border-0 bg-transparent p-0 outline-none -translate-x-1/2 -translate-y-1/2"
-        style={{ ...noDragRegion, left: '82%', top: '68%' }}
-      >
-        <span className="flex h-[16px] w-[16px] items-center justify-center rounded-full bg-neutral-700 shadow-sm ring-2 ring-[#17171B] transition-colors transition-transform group-hover/pin:scale-125 group-hover/pin:bg-red-600">
-          <X className="h-2.5 w-2.5 text-white" />
-        </span>
-      </button>
+    <div className="mt-3 mb-2 flex justify-end first:mt-0">
+      <span className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-black/[0.06] px-2.5 py-1.5 text-left text-sm text-neutral-700 dark:bg-white/[0.10] dark:text-neutral-200">
+        {children}
+      </span>
     </div>
   )
 }
 
-/**
- * The Skipper's status line — the same words under the mascot in both
- * presentations. While the mic gate is open it goes loud (green, mic icon):
- * paired with the listening halo, holding right ⌘ is unmistakably working.
- * While a turn runs, the generic "Thinking…" upgrades to the current
- * activity ("Searching the web…") when one is known — flicker-held by the
- * caller via useHeldLabel.
- */
-function SkipperStatusChip({ state, activity }: { state: CallState; activity?: string | null }) {
-  const statusDisplay = state.status ? STATUS_DISPLAY[state.status] : null
-  const micOpen = !state.micMuted && (state.status === 'listening' || state.pttLocked)
+/** Hairline rule with a word in it — where the peeked past stops. */
+function TurnDivider({ children }: { children: React.ReactNode }) {
   return (
-    <span
-      className={`flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 font-medium text-white shadow-md ${
-        micOpen ? 'bg-green-600 text-[11px] font-semibold' : 'bg-black/60 text-[10px]'
-      }`}
-    >
-      {state.micMuted && (state.status === 'listening' || state.status === 'idle') ? (
-        <>
-          <span className="block h-1.5 w-1.5 rounded-full bg-red-500" />
-          Muted
-        </>
-      ) : state.pttLocked ? (
-        <>
-          <Mic className="h-3 w-3 animate-pulse" />
-          Hands-free — tap ⌘ to send
-        </>
-      ) : state.status === 'listening' ? (
-        <>
-          <Mic className="h-3 w-3 animate-pulse" />
-          Listening — release to send
-        </>
-      ) : statusDisplay ? (
-        <>
-          <span className={`block h-1.5 w-1.5 rounded-full ${statusDisplay.dotClass}`} />
-          {state.status === 'idle'
-            ? 'Hold the mic — or right ⌘'
-            : state.status === 'thinking' && activity
-              ? activity
-              : statusDisplay.label}
-        </>
-      ) : (
-        <>
-          <span className="block h-1.5 w-1.5 rounded-full bg-neutral-500" />
-          Connecting…
-        </>
-      )}
-    </span>
+    <div className="my-2 flex items-center gap-2 text-[10px] uppercase tracking-wider text-neutral-400">
+      <span className="h-px flex-1 bg-black/10 dark:bg-white/15" />
+      {children}
+      <span className="h-px flex-1 bg-black/10 dark:bg-white/15" />
+    </div>
   )
 }
 
 /**
  * The pinned role's layout: the Meet-style floating mini-call pill (absorbed
  * from the old #video-popout window) — camera tile when on + mascot tile,
- * live caption, control bar, collapsible response panel, and the REAL
- * composer as its typed input. All call state arrives over
+ * control bar, and the REAL composer as its typed input. NO transcript
+ * renders here — minimized surfaces show none, in either direction (the
+ * reply is spoken aloud; expand to read). All call state arrives over
  * `video:popout-state`; control actions round-trip through
  * `video:popoutAction` to the app window, which owns the devices. Captures
  * its own webcam preview — MediaStreams can't cross windows.
  *
- * Wrapped in `.dark`: the pill keeps its dark skin even though the summoned
- * bar claims light tokens, so the composer inside renders dark too.
+ * Wrapped in `.dark`: the pill keeps its dark skin even though the Skipper
+ * card claims light tokens, so the composer inside renders dark too.
  */
 function PinnedPill({
   state,
@@ -1492,33 +1424,6 @@ function PinnedPill({
   composer: React.ReactNode
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
-  // Response panel: auto-opens when a new turn starts generating, user can
-  // fold it away. The reply is also spoken — this is the readable half.
-  const [responseOpen, setResponseOpen] = useState(true)
-  const responseRef = useRef<HTMLDivElement | null>(null)
-
-  // A new turn re-opens the panel and rewinds to the top — the reply reads
-  // from its beginning, not wherever the last one left off. The re-open is
-  // a render-time state adjustment (React's sanctioned previous-state
-  // pattern); the scroll rewind is a DOM mutation, so it stays in an effect.
-  const [prevStatus, setPrevStatus] = useState(state.status)
-  if (prevStatus !== state.status) {
-    setPrevStatus(state.status)
-    if (state.status === 'thinking') setResponseOpen(true)
-  }
-  useEffect(() => {
-    if (state.status === 'thinking' && responseRef.current) {
-      responseRef.current.scrollTop = 0
-    }
-  }, [state.status])
-
-  // Grow/shrink the window with the panel (design px; main clamps).
-  const showResponse = Boolean(state.responseText || state.questionText) && responseOpen
-  useEffect(() => {
-    void window.ipc
-      .invoke('video:popoutResize', { height: showResponse ? PINNED_RESPONSE_HEIGHT : PINNED_BASE_HEIGHT })
-      .catch(() => {})
-  }, [showResponse])
 
   // Own camera feed, following the app window's camera-on/off state.
   useEffect(() => {
@@ -1611,16 +1516,16 @@ function PinnedPill({
             }
           `}</style>
           {/* Listening halo — same signal as the tucked mascot: while the
-              mic gate is open (right ⌘ held / hands-free), green rings pulse
+              mic gate is open (talk key held / hands-free), green rings pulse
               around the head. The corner chip alone is too easy to miss. */}
           {!state.micMuted && (state.status === 'listening' || state.pttLocked) && (
             <>
               <span
-                className="pointer-events-none absolute left-1/2 top-1/2 z-10 rounded-full border-[3px] border-green-400/90"
+                className="pointer-events-none absolute left-1/2 top-1/2 z-10 rounded-full border-[3px] border-[var(--rowboat-success)]/90"
                 style={{ width: 88, height: 88, marginLeft: -44, marginTop: -44, animation: 'listen-ring 1.5s cubic-bezier(0, 0, 0.2, 1) infinite' }}
               />
               <span
-                className="pointer-events-none absolute left-1/2 top-1/2 z-10 rounded-full border-[3px] border-green-400/90"
+                className="pointer-events-none absolute left-1/2 top-1/2 z-10 rounded-full border-[3px] border-[var(--rowboat-success)]/90"
                 style={{ width: 88, height: 88, marginLeft: -44, marginTop: -44, animation: 'listen-ring 1.5s cubic-bezier(0, 0, 0.2, 1) 0.5s infinite' }}
               />
             </>
@@ -1647,7 +1552,7 @@ function PinnedPill({
                 </>
               ) : state.pttLocked ? (
                 <>
-                  <span className="block h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
+                  <span className="block h-1.5 w-1.5 rounded-full bg-[var(--rowboat-success)] animate-pulse" />
                   Hands-free
                 </>
               ) : (
@@ -1672,20 +1577,12 @@ function PinnedPill({
             </button>
           )}
         </div>
-        {/* Live caption of the in-progress utterance, floating over the tiles */}
-        {state.interimText && (
-          <div className="pointer-events-none absolute inset-x-1.5 bottom-9 flex justify-center">
-            <span className="max-w-full truncate rounded bg-black/70 px-1.5 py-0.5 text-[10px] text-white/90">
-              {state.interimText}
-            </span>
-          </div>
-        )}
       </div>
 
       {/* Control bar — actions execute in the main app window */}
       <div className="flex h-7 shrink-0 items-center justify-center gap-2" style={noDragRegion}>
         {/* Push-to-talk: hold to talk, quick tap to lock hands-free —
-            mirrors the Right ⌘ key. Pointer capture keeps the release edge
+            mirrors the talk key. Pointer capture keeps the release edge
             even if the cursor slides off mid-hold. */}
         <button
           type="button"
@@ -1698,11 +1595,11 @@ function PinnedPill({
           disabled={state.micMuted}
           className={`flex h-6 select-none items-center gap-1 rounded-full px-2 text-[10px] font-medium transition-colors ${
             state.status === 'listening' || state.pttLocked
-              ? 'bg-green-600 text-white hover:bg-green-500'
+              ? 'bg-[var(--rowboat-success)] text-white hover:bg-[var(--rowboat-success)]/85'
               : 'bg-neutral-700 text-white/90 hover:bg-neutral-600'
           } ${state.micMuted ? 'opacity-50' : ''}`}
-          aria-label="Hold to talk — or hold the right ⌘ key from any app"
-          title="Hold to talk (tap to go hands-free) — or hold the right ⌘ key from any app"
+          aria-label={`Hold to talk — or hold the ${PTT_LABEL} key from any app`}
+          title={`Hold to talk (tap to go hands-free) — or hold the ${PTT_LABEL} key from any app`}
         >
           <Mic className="h-3 w-3" />
           {state.pttLocked ? 'Tap to send' : state.status === 'listening' ? 'Release to send' : 'Hold to talk'}
@@ -1788,45 +1685,11 @@ function PinnedPill({
         </button>
       </div>
 
-      {/* The current exchange, readable in the pill: the question plus its
-          streaming reply. Auto-opens each turn, collapsible, sits between
-          the controls and the composer. */}
-      {(state.responseText || state.questionText) && (
-        <div className="flex min-h-0 shrink-0 flex-col gap-1" style={noDragRegion}>
-          <button
-            type="button"
-            onClick={() => setResponseOpen((v) => !v)}
-            className="flex items-center gap-1 self-start text-[10px] font-medium text-neutral-400 transition-colors hover:text-white"
-          >
-            {responseOpen ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-            {responseOpen ? 'Hide response' : 'Show response'}
-          </button>
-          {responseOpen && (
-            <div
-              ref={responseRef}
-              className="h-[150px] cursor-text select-text overflow-y-auto rounded-md bg-neutral-800 px-2 py-1.5 text-[11px] leading-relaxed"
-            >
-              {state.questionText && (
-                <div className="mb-1.5 whitespace-pre-wrap border-l-2 border-sky-500/70 pl-1.5 text-neutral-400">
-                  {state.questionText}
-                </div>
-              )}
-              <div className="text-neutral-100">
-                {state.responseText && (
-                  <Streamdown className="prose prose-sm prose-invert max-w-none text-[11px] [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0 [&_pre]:my-1.5 [&_pre]:text-[10px] [&_code]:text-[10px]">
-                    {state.responseText}
-                  </Streamdown>
-                )}
-                {state.status === 'thinking' && <span className="animate-pulse">▍</span>}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* The real composer as the pill's typed input — messages land in the
           chat exactly like composer messages, current frames riding along
-          (the app attaches them to any submit while a call is live). */}
+          (the app attaches them to any submit while a call is live). No
+          transcript renders in this pill — minimized surfaces show none
+          (the reply is spoken; expand to read it). */}
       <div className="shrink-0" style={noDragRegion}>
         {composer}
       </div>
@@ -1835,15 +1698,330 @@ function PinnedPill({
 }
 
 /**
- * The tucked presentation of the pinned role: just the mascot, floating on
- * a transparent window — voice-to-voice with the call engine. The mascot is
- * the drag handle (Electron drag regions swallow clicks, so gestures live
- * on hover controls instead): hover reveals hold-to-talk, expand, and
- * end-call. A live screen share keeps its consent badge here — the mascot
- * must never hide an active share. Interim speech and the spoken reply's
- * tail run as a one-line caption under the mascot.
+ * The Rowboat mark, filled — the logo tile's glyph. Same artwork path as
+ * MascotFaceIcon (talking-head.tsx), but inked solid: the 1.5px-outline
+ * version goes wispy at tile sizes over a solid plate.
  */
-function TuckedMascot({
+function RowboatMark({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden="true">
+      <g transform="translate(12 12) scale(0.0245) translate(-497 -489)">
+        <path d="M 158 487 C 330 330, 620 180, 837 148 C 820 480, 640 720, 498 830 Q 550 720, 569 623 C 560 540, 450 440, 352 413 Q 250 440, 158 487 Z" />
+      </g>
+    </svg>
+  )
+}
+
+/**
+ * The logo tile — the Skipper's face now that the mascot has left this
+ * surface: a solid plate that inverts with the skin so the mark always
+ * reads. `glow` is the thinking beacon (a breathing sky halo, box-shadow
+ * only — a transform here would go stale as a drag-region rect).
+ */
+function LogoTile({ size = 36, glow = false }: { size?: number; glow?: boolean }) {
+  return (
+    <span
+      className={`flex flex-none items-center justify-center rounded-[11px] bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900 ${glow ? 'qa-logo-glow' : ''}`}
+      style={{ width: size, height: size }}
+    >
+      <RowboatMark className="h-[62%] w-[62%]" />
+    </span>
+  )
+}
+
+/**
+ * What the status lane is saying right now. One slot, four meanings, in
+ * priority order: an open mic gate outranks everything (the user is
+ * speaking), then a running turn, then the spoken reply, then rest.
+ */
+function laneKind(state: CallState): 'listening' | 'thinking' | 'speaking' | 'idle' {
+  if (!state.micMuted && (state.status === 'listening' || state.pttLocked)) return 'listening'
+  if (state.status === 'thinking') return 'thinking'
+  if (state.ttsState !== 'idle' || state.status === 'speaking') return 'speaking'
+  return 'idle'
+}
+
+/**
+ * Waveform for the status lane. The bars are CSS-driven (staggered
+ * bounce with deterministic pseudo-random heights), not level-driven: the
+ * real audio lives in the app window and MediaStreams can't cross windows —
+ * the same reason the mascot lip-synced off a synthesized level.
+ */
+function WaveLane({ bars, className = '' }: { bars: number; className?: string }) {
+  const heights = useMemo(
+    () =>
+      Array.from({ length: bars }, (_, i) =>
+        7 + Math.round(13 * Math.abs(Math.sin(0.4 + i * 0.9) * Math.cos(i * 0.37))),
+      ),
+    [bars],
+  )
+  return (
+    <span className={`flex min-w-0 items-center gap-[3px] overflow-hidden ${className}`}>
+      {heights.map((h, i) => (
+        <span
+          key={i}
+          className="qa-wave-bar w-[3px] flex-none rounded-full bg-sky-500 dark:bg-sky-400"
+          style={{ height: h, animationDelay: `${-((i * 137) % 900)}ms` }}
+        />
+      ))}
+    </span>
+  )
+}
+
+/**
+ * The speak wave — the reply being read aloud. Same bars as the listening
+ * waveform, but a COHERENT rolling wave: uniform heights with a linear
+ * phase offset, so a single crest travels across the lane. Listening is
+ * jittery (pseudo-random heights and delays — a voice), speaking is
+ * orderly (a synthesized one); the two read differently at a glance.
+ */
+function SpeakLane({ bars, className = '' }: { bars: number; className?: string }) {
+  return (
+    <span className={`flex min-w-0 items-center gap-[3px] overflow-hidden ${className}`}>
+      {Array.from({ length: bars }, (_, i) => (
+        <span
+          key={i}
+          className="qa-speak-bar w-[3px] flex-none rounded-full bg-sky-400 dark:bg-sky-300"
+          style={{ height: 16, animationDelay: `${-((i * 90) % 1200)}ms` }}
+        />
+      ))}
+    </span>
+  )
+}
+
+/**
+ * The status lane — the mini call pill's one slot that says what's
+ * happening: a live waveform while the mic gate is open, the running
+ * activity ("Searching the web…", flicker-held by the caller) as shimmer
+ * text while a turn thinks, the rolling speak wave while the reply is
+ * spoken, and the talk-key hint ("Hold right ⌘" / "Hold right Ctrl", from
+ * shared/ptt-key.ts) at rest — the invitation, not decoration. (The open
+ * card carries these signals elsewhere: the composer's recording bar, the
+ * panel's shimmer row, and the strip logo's glow.)
+ */
+function StatusLane({
+  state,
+  activity,
+  bars,
+  className = '',
+}: {
+  state: CallState
+  activity?: string | null
+  bars: number
+  className?: string
+}) {
+  const kind = laneKind(state)
+  return (
+    <span className={`flex h-7 min-w-0 items-center ${className}`}>
+      {kind === 'listening' ? (
+        <WaveLane bars={bars} className="w-full" />
+      ) : kind === 'speaking' ? (
+        <SpeakLane bars={bars} className="w-full" />
+      ) : kind === 'thinking' ? (
+        <span className="flex min-w-0 items-center gap-2">
+          <Loader className="qa-spin h-3.5 w-3.5 flex-none text-sky-500 dark:text-sky-400" />
+          <span className="qa-shimmer min-w-0 truncate text-[12.5px] font-medium">
+            {activity ?? 'Thinking…'}
+          </span>
+        </span>
+      ) : (
+        <span className="truncate whitespace-nowrap text-[12px] text-neutral-400 dark:text-neutral-500">
+          Hold {PTT_LABEL}
+        </span>
+      )}
+    </span>
+  )
+}
+
+/**
+ * The share toggle — the bow light, relocated from the mascot's hull to the
+ * footer dock: lit sky + pulsing dot = broadcasting (the lit button IS the
+ * consent badge). The choice is STICKY — future summons start already
+ * sharing until it's turned off (persisted app-side).
+ */
+function ShareButton({
+  state,
+  sendAction,
+  className,
+  tooltipDelay,
+}: {
+  state: CallState
+  sendAction: (action: PopoutAction) => void
+  className: string
+  tooltipDelay?: number
+}) {
+  return (
+    <Tooltip delayDuration={tooltipDelay}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          style={noDragRegion}
+          onClick={() => sendAction('toggle-share')}
+          aria-label={state.screenSharing ? 'Stop sharing your screen' : 'Share your screen'}
+          className={`relative flex flex-none items-center justify-center rounded-full ring-1 ring-inset transition active:scale-95 ${
+            state.screenSharing
+              ? 'bg-sky-500/15 text-sky-600 ring-sky-500/30 hover:bg-sky-500/25 dark:bg-sky-400/20 dark:text-sky-300 dark:ring-sky-400/30'
+              : CHIP_IDLE
+          } ${className}`}
+        >
+          <MonitorUp className="h-4 w-4" />
+          {state.screenSharing && (
+            <span className="absolute -right-0.5 -top-0.5 block h-2 w-2 animate-pulse rounded-full bg-sky-500 ring-2 ring-white dark:bg-sky-400 dark:ring-neutral-900" />
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">
+        {state.screenSharing
+          ? 'Sharing screen — click to stop'
+          : 'Share your screen — frames ride along with every question'}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+/**
+ * The talk control — mic, stop, and mute-aware, in one button (the mascot's
+ * mic pin, relocated). Clicking it works exactly like the app composer's
+ * mic: one click starts the capture (a programmatic tap — down+up — locks
+ * the PTT machine's hands-free mode, so the mic stays open with the
+ * recording bar showing), then the bar's ↑ (or this button again, or
+ * Enter) sends and its ✕ (or Esc) discards. Holding the talk key is the
+ * other route into the same capture. While a turn is in flight the mic is
+ * dead anyway, so it morphs into Stop; muted it becomes the unmute
+ * affordance.
+ */
+function TalkButton({
+  state,
+  sendAction,
+  className,
+  tooltipDelay,
+  monochrome = false,
+}: {
+  state: CallState
+  sendAction: (action: PopoutAction) => void
+  className: string
+  tooltipDelay?: number
+  monochrome?: boolean
+}) {
+  const activeStyle = monochrome
+    ? 'bg-neutral-900 text-white ring-neutral-900 hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900 dark:ring-neutral-100 dark:hover:bg-white'
+    : 'bg-sky-500 text-white ring-sky-500 hover:bg-sky-400'
+  const busy = state.status === 'thinking' || state.status === 'speaking'
+  const micOpen = !state.micMuted && (state.status === 'listening' || state.pttLocked)
+  if (busy) {
+    return (
+      <Tooltip delayDuration={tooltipDelay}>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            style={noDragRegion}
+            onClick={() => sendAction('stop-speaking')}
+            aria-label="Stop the assistant"
+            className={`flex flex-none items-center justify-center rounded-full transition active:scale-95 ${activeStyle} ${className}`}
+          >
+            <Square className="h-3.5 w-3.5 fill-current" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top">Stop — cut the reply short (the session keeps going)</TooltipContent>
+      </Tooltip>
+    )
+  }
+  return (
+    <Tooltip delayDuration={tooltipDelay}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          style={noDragRegion}
+          onClick={() => {
+            if (state.micMuted) {
+              sendAction('toggle-mic')
+              return
+            }
+            if (micOpen) {
+              // Same as the recording bar's ↑ — finish and send.
+              sendAction('ptt-up')
+              return
+            }
+            // Click-to-record: a programmatic tap. The PTT machine reads a
+            // sub-tap-threshold down→up as "lock hands-free", which is
+            // exactly the open-until-sent capture the app composer's mic
+            // gives.
+            sendAction('ptt-down')
+            sendAction('ptt-up')
+          }}
+          aria-label={
+            micOpen ? 'Send voice input' : state.micMuted ? 'Unmute the mic' : 'Voice input'
+          }
+          className={`flex flex-none select-none items-center justify-center rounded-full ring-1 ring-inset transition active:scale-95 ${
+            micOpen
+              ? (monochrome ? activeStyle : 'bg-sky-500 text-white ring-sky-500')
+              : state.micMuted
+                ? 'bg-red-500/10 text-red-500 ring-red-500/30 hover:bg-red-500/20'
+                : CHIP_IDLE
+          } ${className}`}
+        >
+          {micOpen ? (
+            <Square className="h-3.5 w-3.5 fill-current" />
+          ) : state.micMuted ? (
+            <MicOff className="h-4 w-4" />
+          ) : (
+            <Mic className="h-4 w-4" />
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">
+        {micOpen
+          ? 'Listening — click to send (✕ or Esc cancels)'
+          : state.micMuted
+            ? 'Mic muted — click to unmute'
+            : `Voice input — click and speak, or hold the ${PTT_LABEL} key`}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+/** End & close — a live session can't be hidden while it keeps listening. */
+function EndButton({
+  sendAction,
+  className,
+  tooltipDelay,
+}: {
+  sendAction: (action: PopoutAction) => void
+  className: string
+  tooltipDelay?: number
+}) {
+  return (
+    <Tooltip delayDuration={tooltipDelay}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          style={noDragRegion}
+          onClick={() => sendAction('end-call')}
+          aria-label="End the voice session and close"
+          className={`flex flex-none items-center justify-center rounded-full text-neutral-400 ring-1 ring-inset ring-black/10 transition hover:bg-red-500/10 hover:text-red-600 active:scale-95 dark:text-neutral-500 dark:ring-white/10 dark:hover:bg-red-400/10 dark:hover:text-red-400 ${className}`}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">End & close (a live session can't be hidden while it keeps listening)</TooltipContent>
+    </Tooltip>
+  )
+}
+
+/**
+ * The folded Skipper: the MINI CALL PILL — the card compressed to one row,
+ * always (a bare logo chip hid the session's life; the pill wears it):
+ * logo (click to unfold) · status lane · share · talk/stop · end, plus the
+ * « unfold handle on the left edge — the visible way back to the text
+ * input, mirroring the card's » tuck handle. The lane keeps narrating
+ * while folded — waveform while the user speaks, the running activity
+ * while a turn thinks, the rolling speak wave while the reply is read
+ * aloud, the talk-key hint at rest — and beyond that hint the MOTION is
+ * the whole story: the pill deliberately shows no transcript in either
+ * direction (the user tucked the text away; unfold to read).
+ */
+function TuckedDock({
+  vertical = false,
   state,
   activity,
   sendAction,
@@ -1853,90 +2031,78 @@ function TuckedMascot({
   activity?: string | null
   sendAction: (action: PopoutAction) => void
   onExpand: () => void
+  vertical?: boolean
 }) {
-  // No TTS audio pipeline in this window — synthesize the mouth level, same
-  // as the pill's mascot tile.
-  const getLevel = useCallback(() => 0.45 + 0.35 * Math.sin(performance.now() / 90), [])
-
-  // One-line caption: the user's in-flight utterance wins; otherwise the
-  // tail of the reply while it's being spoken (markdown stripped).
-  const replyTail =
-    state.ttsState !== 'idle' || state.status === 'thinking'
-      ? (state.responseText ?? '')
-          .replace(/[#*_`>[\]]/g, '')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(-90)
-      : ''
-  const caption = state.interimText || replyTail
-
-  // Mic gate open (holding right ⌘ / the pin, or hands-free lock): the ONE
-  // state the user must never have to squint for — without visible feedback
-  // there is no way to tell a working hold from a dead key hook.
-  const micOpen = !state.micMuted && (state.status === 'listening' || state.pttLocked)
-
+  const tooltipDelay = 700
+  const shortcutState = useQuickAskShortcut()
+  const shortcutLabel = quickAskShortcut.formatShortcut(shortcutState.accelerator, isMac)
+  const expandTip = `Bring the text back (${shortcutLabel} works too)`
+  const statusKind = laneKind(state)
+  const statusLabel = statusKind === 'thinking'
+    ? (activity ?? 'Thinking…')
+    : STATUS_DISPLAY[statusKind].label
+  const logoTip = vertical ? `${statusLabel} · Click to open text (${shortcutLabel})` : expandTip
   return (
-    <div
-      className="group relative flex h-screen w-screen select-none flex-col items-center justify-end overflow-hidden pb-2"
-      style={dragRegion}
-    >
-      <style>{`
-        @keyframes tucked-pop {
-          0% { opacity: 0; transform: scale(0.5); }
-          100% { opacity: 1; transform: scale(1); }
-        }
-        @keyframes listen-ring {
-          0% { transform: scale(0.72); opacity: 0.9; }
-          100% { transform: scale(1.28); opacity: 0; }
-        }
-      `}</style>
-
-      {/* On duty = cowboy hat on; the controls are enamel pins on the hat
-          band, drawn in the artwork's own ink and always visible. They ride
-          inside TalkingHead's bobbing container (hatOverlay) so they never
-          detach from the hat. Pin art is small; each sits in a 26px no-drag
-          hit target that grows on hover. */}
-      {/* -mb pulls the caption/chip up under the boat: the SVG box has dead
-          space below the ripples that read as a big gap. */}
-      <div className="relative -mb-4" style={{ animation: 'tucked-pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1)' }}>
-        {/* Listening halo: expanding green rings around the head while the
-            mic gate is open. Peripheral-vision feedback — the user is
-            usually looking at their own work, not at the chip's 10px text. */}
-        {micOpen && (
-          <>
-            <span
-              className="pointer-events-none absolute left-1/2 z-10 rounded-full border-[3px] border-green-400/90"
-              style={{ top: '42%', width: 104, height: 104, marginLeft: -52, marginTop: -52, animation: 'listen-ring 1.5s cubic-bezier(0, 0, 0.2, 1) infinite' }}
-            />
-            <span
-              className="pointer-events-none absolute left-1/2 z-10 rounded-full border-[3px] border-green-400/90"
-              style={{ top: '42%', width: 104, height: 104, marginLeft: -52, marginTop: -52, animation: 'listen-ring 1.5s cubic-bezier(0, 0, 0.2, 1) 0.5s infinite' }}
-            />
-          </>
-        )}
-        <TalkingHead
-          // Thinking = thought bubbles (the calm version — rowing on every
-          // turn wore thin): status 'thinking' with idle TTS maps to the
-          // 'synthesizing' state, which renders bubbles + raised eyes.
-          ttsState={state.status === 'thinking' && state.ttsState === 'idle' ? 'synthesizing' : state.ttsState}
-          getLevel={getLevel}
-          size={132}
-          hat="cowboy"
-          hatOverlay={
-            <SkipperPins state={state} sendAction={sendAction} textPin="expand" onTextPin={onExpand} />
-          }
-        />
-      </div>
-
-      {/* Caption + status chip, readable over any desktop. */}
-      <div className="flex h-4 max-w-full items-center px-2">
-        {caption && (
-          <span className="truncate rounded bg-black/70 px-1.5 py-px text-[10px] text-white/90">{caption}</span>
-        )}
-      </div>
-      {/* Pure status line — the CONTROLS are the pins. */}
-      <div className="flex h-6 items-center">
-        <SkipperStatusChip state={state} activity={activity} />
+    <div data-qa-passthrough className="qa-pop flex min-w-0 flex-col items-end">
+      <div className="relative">
+        <div
+          style={dragRegion}
+          className={`flex cursor-grab items-center gap-2.5 border border-black/10 bg-white/[0.97] shadow-[0_12px_32px_rgba(0,0,0,0.18),0_2px_10px_rgba(0,0,0,0.10)] dark:border-white/15 dark:bg-neutral-900/[0.97] dark:shadow-[0_12px_32px_rgba(0,0,0,0.55),0_2px_10px_rgba(0,0,0,0.4)] ${vertical ? 'w-12 flex-col rounded-l-2xl border-r-0 px-1 py-2' : 'rounded-full p-2 pr-2.5'}`}
+        >
+          <Tooltip delayDuration={tooltipDelay}>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                style={noDragRegion}
+                onClick={onExpand}
+                aria-label={vertical ? `${statusLabel} · Open text panel` : 'Bring the text back'}
+                aria-expanded={false}
+                className={`flex-none transition active:scale-95 ${vertical ? 'cursor-pointer rounded-[11px] hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:hover:bg-white/10' : ''}`}
+              >
+                {vertical ? (
+                  <span data-status={statusKind} className="qa-dock-logo flex h-[34px] w-[34px] items-center justify-center text-neutral-700 dark:text-neutral-200">
+                    <MascotFaceIcon size={24} />
+                    {statusKind === 'speaking' && (
+                      <svg className="qa-speech-crests" viewBox="0 0 44 44" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
+                        <g className="qa-speech-crest qa-speech-crest-left"><path d="M9 16 Q5 22 9 28" /></g>
+                        <g className="qa-speech-crest qa-speech-crest-left qa-speech-crest-outer"><path d="M5 12 Q-1 22 5 32" /></g>
+                        <g className="qa-speech-crest qa-speech-crest-right"><path d="M35 16 Q39 22 35 28" /></g>
+                        <g className="qa-speech-crest qa-speech-crest-right qa-speech-crest-outer"><path d="M39 12 Q45 22 39 32" /></g>
+                      </svg>
+                    )}
+                  </span>
+                ) : <LogoTile size={34} glow={state.status === 'thinking'} />}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side={vertical ? 'left' : 'top'}>{logoTip}</TooltipContent>
+          </Tooltip>
+          {vertical ? (
+            <span role="status" className="sr-only">{statusLabel}</span>
+          ) : <StatusLane state={state} activity={activity} bars={20} className="w-[112px]" />}
+          <ShareButton tooltipDelay={tooltipDelay} state={state} sendAction={sendAction} className="h-7 w-7" />
+          <TalkButton tooltipDelay={tooltipDelay} state={state} sendAction={sendAction} monochrome={vertical} className={vertical ? 'h-7 w-7' : 'h-8 w-8'} />
+          {!vertical && <EndButton tooltipDelay={tooltipDelay} sendAction={sendAction} className="h-7 w-7" />}
+        </div>
+        {/* The vertical dock expands through its Assistant icon. Keep the
+            camera pill's existing external handle. */}
+        {!vertical && <span
+          className="pointer-events-none absolute z-10 flex h-8 w-8 items-center justify-center"
+          style={{ ...noDragRegion, top: 'calc(50% - 16px)', left: '-16px' }}
+        >
+          <Tooltip delayDuration={tooltipDelay}>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onExpand}
+                aria-label="Bring the text back"
+                className="pointer-events-auto flex h-6 w-6 items-center justify-center rounded-full border border-black/10 bg-white text-neutral-500 shadow-[0_2px_8px_rgba(0,0,0,0.15)] transition hover:-translate-x-0.5 hover:bg-neutral-50 hover:text-neutral-900 active:scale-90 dark:border-white/15 dark:bg-neutral-800 dark:text-neutral-400 dark:shadow-[0_2px_8px_rgba(0,0,0,0.5)] dark:hover:bg-neutral-700 dark:hover:text-neutral-100"
+              >
+                <ChevronsLeft className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">{expandTip}</TooltipContent>
+          </Tooltip>
+        </span>}
       </div>
     </div>
   )
